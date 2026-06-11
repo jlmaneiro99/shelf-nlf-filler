@@ -5,6 +5,7 @@ from typing import Dict, List, Optional, Tuple, Union
 from copy import deepcopy, copy as copy_obj
 import base64
 import io
+import re
 import openpyxl
 from openpyxl.cell.cell import MergedCell
 import datetime
@@ -244,6 +245,58 @@ def find_header_row(ws, scan_rows: int = 30) -> int:
     return best_row
 
 
+PRODUCT_HEADER_RE = re.compile(r'^PRODUCT\s+(\d+)\s*$', re.I)
+
+
+def find_product_header_info(ws, scan_rows: int = 15) -> Tuple[Optional[int], Optional[int], int]:
+    """Return (header_row, first_product_col, max_existing_product_num) from PRODUCT X labels."""
+    for row in range(1, scan_rows + 1):
+        found: List[Tuple[int, int]] = []
+        for col in range(1, 40):
+            cell = ws.cell(row=row, column=col)
+            if isinstance(cell, MergedCell):
+                continue
+            m = PRODUCT_HEADER_RE.match(str(cell.value or '').strip())
+            if m:
+                found.append((col, int(m.group(1))))
+        if found:
+            found.sort()
+            return row, found[0][0], max(n for _, n in found)
+    return None, None, 0
+
+
+def copy_cell_style(source, target) -> None:
+    if source.fill and source.fill.fill_type == 'solid':
+        target.fill = copy_obj(source.fill)
+    if source.font:
+        target.font = copy_obj(source.font)
+    if source.alignment:
+        target.alignment = copy_obj(source.alignment)
+
+
+def ensure_product_column_header(
+    ws,
+    header_row: int,
+    first_product_col: int,
+    product_num: int,
+) -> None:
+    """Write PRODUCT N header and sub-header for columns beyond the template."""
+    target_col = first_product_col + product_num - 1
+    template_header_cell = ws.cell(row=header_row, column=first_product_col)
+    template_sub_cell = ws.cell(row=header_row + 1, column=first_product_col)
+
+    header_cell = ws.cell(row=header_row, column=target_col)
+    if not PRODUCT_HEADER_RE.match(str(header_cell.value or '').strip()):
+        header_cell.value = f"PRODUCT {product_num}"
+        copy_cell_style(template_header_cell, header_cell)
+
+    sub_cell = ws.cell(row=header_row + 1, column=target_col)
+    expected_sub = f"Fill in product {product_num} details below ↓"
+    if str(sub_cell.value or '').strip() != expected_sub:
+        sub_cell.value = expected_sub
+        copy_cell_style(template_sub_cell, sub_cell)
+
+
 def fill_tabs(wb, products: List[ProductMappings]) -> int:
     template_name = find_template_sheet(wb)
     template_ws = wb[template_name]
@@ -268,9 +321,13 @@ def fill_columns(wb, products: List[ProductMappings]) -> int:
     ws = wb[find_template_sheet(wb)]
     template_col = 3
     data_start, data_end = find_data_row_range(ws, label_col=2)
+    header_row, first_product_col, max_existing_products = find_product_header_info(ws)
     filled = 0
     for i, prod in enumerate(products):
         target_col = 3 + i
+        product_num = i + 1
+        if header_row and first_product_col and product_num > max_existing_products:
+            ensure_product_column_header(ws, header_row, first_product_col, product_num)
         fillable_mappings = [m for m in prod.mappings if fillable(m)]
         has_rows = bool(fillable_mappings) and all(m.row is not None for m in fillable_mappings)
         if has_rows:
