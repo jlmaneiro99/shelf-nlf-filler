@@ -131,4 +131,41 @@ assert wb["Product 1"]["C4"].value == "Solo"
 assert wb.sheetnames == ["Product 1", "Additional", "C.O.O List"]
 assert res["filename"].startswith("Suma_Solo_")
 print("single product OK —", res["filename"])
+
+# --- merged cells in value column ---
+def build_merged_template() -> bytes:
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "New Line Form"
+    ws.cell(row=4, column=2).value = "Product Name"
+    ws.cell(row=5, column=2).value = "Brand"
+    ws.merge_cells("C4:D4")
+    ws.cell(row=4, column=3).value = ""
+    out = io.BytesIO()
+    wb.save(out)
+    return out.getvalue()
+
+
+req = FillRequest(
+    file_base64=base64.b64encode(build_merged_template()).decode(),
+    fill_mode="tabs",
+    products=[
+        ProductMappings(
+            product_name="Merged Test",
+            mappings=[
+                FieldMapping(field_name="Product Name", mapped_value="Merged Test", status="filled"),
+                FieldMapping(field_name="Brand", mapped_value="Nine Streets", status="filled"),
+            ],
+        )
+    ],
+    retailer_name="Retailer",
+)
+res = asyncio.run(fill_nlf(req))
+wb = openpyxl.load_workbook(io.BytesIO(base64.b64decode(res["file_base64"])))
+ws = wb["New Line Form"]
+assert ws["C4"].value == "Merged Test", ws["C4"].value
+assert ws["C5"].value == "Nine Streets", ws["C5"].value
+assert res["fields_filled"] == 2, res
+print("merged cells OK — wrote through merged ranges")
+
 print("ALL TESTS PASSED")

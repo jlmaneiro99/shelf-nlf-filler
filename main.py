@@ -1,11 +1,12 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from copy import deepcopy
 import base64
 import io
 import openpyxl
+from openpyxl.cell.cell import MergedCell
 import datetime
 import os
 
@@ -23,7 +24,6 @@ class FieldMapping(BaseModel):
     field_name: str
     mapped_value: Optional[str] = None
     status: str
-    # Optional precise location (1-based row, column letter) from Step 3 mapping
     row: Optional[int] = None
     col: Optional[str] = None
 
@@ -51,37 +51,85 @@ def norm(label) -> str:
     return str(label).strip().lower()
 
 
+def safe_write(ws, row_num: int, col: int, value) -> None:
+    """Write to a cell, redirecting merged cells to the top-left of their range."""
+    cell = ws.cell(row=row_num, column=col)
+    if isinstance(cell, MergedCell):
+        for merge_range in ws.merged_cells.ranges:
+            if (
+                merge_range.min_row <= row_num <= merge_range.max_row
+                and merge_range.min_col <= col <= merge_range.max_col
+            ):
+                top_left = ws.cell(row=merge_range.min_row, column=merge_range.min_col)
+                top_left.value = value
+                return
+        return
+    cell.value = value
+
+
 def find_template_sheet(wb) -> str:
+    product_sheet = None
     for name in wb.sheetnames:
-        nl = norm(name)
-        if nl.startswith('product') or nl == 'template' or nl == 'new line':
-            return name
-    return wb.sheetnames[0]
+        nl = name.lower()
+        if (
+            nl.startswith('product')
+            or nl.startswith('sku')
+            or nl == 'template'
+            or nl == 'new line'
+            or nl == 'new line form'
+            or nl == 'nlf'
+            or nl == 'form'
+            or 'line form' in nl
+            or 'new line' in nl
+            or 'submission' in nl
+        ):
+            product_sheet = name
+            break
+
+    if not product_sheet:
+        best = None
+        best_count = 0
+        for name in wb.sheetnames:
+            ws_temp = wb[name]
+            count = sum(
+                1
+                for row in ws_temp.iter_rows()
+                for cell in row
+                if cell.value and not isinstance(cell, MergedCell)
+            )
+            if count > best_count:
+                best_count = count
+                best = name
+        product_sheet = best or wb.sheetnames[0]
+
+    return product_sheet
 
 
-def build_label_to_row(ws) -> Dict[str, int]:
-    label_to_row = {}
-    for row in ws.iter_rows(min_col=2, max_col=2):
+def build_label_map(ws) -> Dict[str, Tuple[int, int]]:
+    """Map normalised field labels to (row, label_column). Skips merged cells."""
+    label_map: Dict[str, Tuple[int, int]] = {}
+    for row in ws.iter_rows():
         for cell in row:
+            if isinstance(cell, MergedCell):
+                continue
             if cell.value:
                 label = norm(cell.value)
-                if label not in label_to_row:
-                    label_to_row[label] = cell.row
-    return label_to_row
+                if label and label not in label_map:
+                    label_map[label] = (cell.row, cell.column)
+    return label_map
 
 
-def resolve_row(mapping: FieldMapping, label_to_row: Dict[str, int]) -> Optional[int]:
-    """Find the target row: explicit row first, then exact label, then fuzzy."""
-    if mapping.row:
-        return mapping.row
+def resolve_label_pos(
+    mapping: FieldMapping, label_map: Dict[str, Tuple[int, int]]
+) -> Optional[Tuple[int, int]]:
     search = norm(mapping.field_name)
-    row_num = label_to_row.get(search)
-    if row_num is None:
-        for label, rn in label_to_row.items():
+    pos = label_map.get(search)
+    if pos is None:
+        for label, candidate in label_map.items():
             if search in label or label in search:
-                row_num = rn
+                pos = candidate
                 break
-    return row_num
+    return pos
 
 
 def fillable(mapping: FieldMapping) -> bool:
@@ -89,25 +137,44 @@ def fillable(mapping: FieldMapping) -> bool:
 
 
 def fill_sheet(ws, mappings: List[FieldMapping], force_col: Optional[int] = None) -> int:
-    """Write mapped values into a vertical (label in column B) sheet.
-    Only cell .value is touched — styles, fills and data validation
-    are never modified."""
-    label_to_row = build_label_to_row(ws)
+    """Write mapped values into a vertical NLF sheet (labels in any column)."""
+    label_map = build_label_map(ws)
     filled = 0
+
     for mapping in mappings:
         if not fillable(mapping):
             continue
-        row_num = resolve_row(mapping, label_to_row)
-        if row_num is None:
-            continue
-        if force_col is not None:
-            col_idx = force_col
-        elif mapping.col:
-            col_idx = col_letter_to_index(mapping.col)
+
+        row_num: Optional[int] = None
+        value_col: Optional[int] = None
+
+        if mapping.row:
+            row_num = mapping.row
+            if force_col is not None:
+                value_col = force_col
+            elif mapping.col:
+                value_col = col_letter_to_index(mapping.col)
+            else:
+                pos = resolve_label_pos(mapping, label_map)
+                value_col = (pos[1] + 1) if pos else 3
         else:
-            col_idx = 3
-        ws.cell(row=row_num, column=col_idx).value = mapping.mapped_value
+            pos = resolve_label_pos(mapping, label_map)
+            if pos is None:
+                continue
+            row_num, label_col = pos
+            if force_col is not None:
+                value_col = force_col
+            elif mapping.col:
+                value_col = col_letter_to_index(mapping.col)
+            else:
+                value_col = label_col + 1
+
+        if row_num is None or value_col is None:
+            continue
+
+        safe_write(ws, row_num, value_col, mapping.mapped_value)
         filled += 1
+
     return filled
 
 
@@ -124,8 +191,13 @@ def copy_template_sheet(wb, template_ws, title: str):
 def find_header_row(ws, scan_rows: int = 30) -> int:
     """Header row = the row with the most non-empty cells (horizontal NLFs)."""
     best_row, best_count = 1, 0
-    for row in ws.iter_rows(min_row=1, max_row=min(scan_rows, ws.max_row)):
-        count = sum(1 for cell in row if cell.value not in (None, ''))
+    max_row = min(scan_rows, ws.max_row or scan_rows)
+    for row in ws.iter_rows(min_row=1, max_row=max_row):
+        count = sum(
+            1
+            for cell in row
+            if not isinstance(cell, MergedCell) and cell.value not in (None, '')
+        )
         if count > best_count:
             best_row, best_count = row[0].row, count
     return best_row
@@ -145,7 +217,6 @@ def fill_tabs(wb, products: List[ProductMappings]) -> int:
                 ws = wb[target_name]
             else:
                 ws = copy_template_sheet(wb, template_ws, target_name)
-                # Place it right after the previous product sheet
                 current_idx = wb.sheetnames.index(ws.title)
                 wb.move_sheet(ws.title, offset=(template_idx + i) - current_idx)
         filled += fill_sheet(ws, prod.mappings)
@@ -166,6 +237,8 @@ def fill_rows(wb, products: List[ProductMappings]) -> int:
 
     col_to_field: Dict[int, str] = {}
     for cell in ws[header_row]:
+        if isinstance(cell, MergedCell):
+            continue
         if cell.value not in (None, ''):
             col_to_field[cell.column] = norm(cell.value)
 
@@ -176,13 +249,12 @@ def fill_rows(wb, products: List[ProductMappings]) -> int:
         for col_idx, field_label in col_to_field.items():
             value = values.get(field_label)
             if value is None:
-                # Fuzzy match: header label contains field name or vice versa
                 for name, v in values.items():
                     if name in field_label or field_label in name:
                         value = v
                         break
             if value is not None:
-                ws.cell(row=row_num, column=col_idx).value = value
+                safe_write(ws, row_num, col_idx, value)
                 filled += 1
     return filled
 
