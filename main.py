@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 from copy import deepcopy, copy as copy_obj
 import base64
 import io
@@ -25,7 +25,7 @@ class FieldMapping(BaseModel):
     mapped_value: Optional[str] = None
     status: str
     row: Optional[int] = None
-    col: Optional[str] = None
+    col: Optional[Union[int, str]] = None
 
 
 class ProductMappings(BaseModel):
@@ -136,18 +136,37 @@ def fillable(mapping: FieldMapping) -> bool:
     return bool(mapping.mapped_value) and mapping.status != 'missing'
 
 
+def resolve_col_index(mapping: FieldMapping, force_col: Optional[int] = None) -> Optional[int]:
+    if mapping.col is not None:
+        if isinstance(mapping.col, int):
+            return mapping.col
+        return col_letter_to_index(str(mapping.col))
+    return force_col
+
+
 def fill_sheet(
     ws,
     mappings: List[FieldMapping],
     force_col: Optional[int] = None,
-    strict_rows: bool = False,
+    strict_coords: bool = False,
 ) -> int:
-    """Write mapped values into a vertical NLF sheet (labels in any column)."""
-    label_map = build_label_map(ws) if not strict_rows else {}
+    """Pure writer: use row+col coordinates when provided; label fallback otherwise."""
+    label_map = build_label_map(ws)
     filled = 0
 
     for mapping in mappings:
         if not fillable(mapping):
+            continue
+
+        # Direct coordinate write — trust Claude row; allow force_col to override column in columns mode
+        if mapping.row is not None and (mapping.col is not None or force_col is not None):
+            col_idx = force_col if force_col is not None else resolve_col_index(mapping)
+            if col_idx is not None:
+                safe_write(ws, mapping.row, col_idx, mapping.mapped_value)
+                filled += 1
+            continue
+
+        if strict_coords:
             continue
 
         row_num: Optional[int] = None
@@ -155,26 +174,13 @@ def fill_sheet(
 
         if mapping.row:
             row_num = mapping.row
-            if force_col is not None:
-                value_col = force_col
-            elif mapping.col:
-                value_col = col_letter_to_index(mapping.col)
-            else:
-                pos = resolve_label_pos(mapping, label_map) if label_map else None
-                value_col = (pos[1] + 1) if pos else 3
-        elif strict_rows:
-            continue
+            value_col = resolve_col_index(mapping, force_col) or 3
         else:
             pos = resolve_label_pos(mapping, label_map)
             if pos is None:
                 continue
             row_num, label_col = pos
-            if force_col is not None:
-                value_col = force_col
-            elif mapping.col:
-                value_col = col_letter_to_index(mapping.col)
-            else:
-                value_col = label_col + 1
+            value_col = force_col if force_col is not None else label_col + 1
 
         if row_num is None or value_col is None:
             continue
@@ -266,8 +272,11 @@ def fill_columns(wb, products: List[ProductMappings]) -> int:
     for i, prod in enumerate(products):
         target_col = 3 + i
         fillable_mappings = [m for m in prod.mappings if fillable(m)]
-        strict = bool(fillable_mappings) and all(m.row is not None for m in fillable_mappings)
-        filled += fill_sheet(ws, prod.mappings, force_col=target_col, strict_rows=strict)
+        has_rows = bool(fillable_mappings) and all(m.row is not None for m in fillable_mappings)
+        if has_rows:
+            filled += fill_sheet(ws, prod.mappings, force_col=target_col, strict_coords=True)
+        else:
+            filled += fill_sheet(ws, prod.mappings, force_col=target_col)
         if target_col != template_col:
             copy_column_format(ws, template_col, target_col, data_start, data_end)
     return filled
