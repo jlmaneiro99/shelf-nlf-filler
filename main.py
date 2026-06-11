@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Dict, List, Optional, Tuple
-from copy import deepcopy
+from copy import deepcopy, copy as copy_obj
 import base64
 import io
 import openpyxl
@@ -136,9 +136,14 @@ def fillable(mapping: FieldMapping) -> bool:
     return bool(mapping.mapped_value) and mapping.status != 'missing'
 
 
-def fill_sheet(ws, mappings: List[FieldMapping], force_col: Optional[int] = None) -> int:
+def fill_sheet(
+    ws,
+    mappings: List[FieldMapping],
+    force_col: Optional[int] = None,
+    strict_rows: bool = False,
+) -> int:
     """Write mapped values into a vertical NLF sheet (labels in any column)."""
-    label_map = build_label_map(ws)
+    label_map = build_label_map(ws) if not strict_rows else {}
     filled = 0
 
     for mapping in mappings:
@@ -155,8 +160,10 @@ def fill_sheet(ws, mappings: List[FieldMapping], force_col: Optional[int] = None
             elif mapping.col:
                 value_col = col_letter_to_index(mapping.col)
             else:
-                pos = resolve_label_pos(mapping, label_map)
+                pos = resolve_label_pos(mapping, label_map) if label_map else None
                 value_col = (pos[1] + 1) if pos else 3
+        elif strict_rows:
+            continue
         else:
             pos = resolve_label_pos(mapping, label_map)
             if pos is None:
@@ -176,6 +183,34 @@ def fill_sheet(ws, mappings: List[FieldMapping], force_col: Optional[int] = None
         filled += 1
 
     return filled
+
+
+def find_data_row_range(ws, label_col: int = 2) -> Tuple[int, int]:
+    """First and last rows with field labels in the label column."""
+    start: Optional[int] = None
+    end: Optional[int] = None
+    for row in ws.iter_rows():
+        for cell in row:
+            if cell.column != label_col or isinstance(cell, MergedCell):
+                continue
+            if cell.value and str(cell.value).strip():
+                if start is None:
+                    start = cell.row
+                end = cell.row
+    return start or 5, end or (ws.max_row or 5)
+
+
+def copy_column_format(ws, template_col: int, target_col: int, data_start_row: int, data_end_row: int) -> None:
+    """Copy solid fill (and number format) from template product column to target column."""
+    for row in range(data_start_row, data_end_row + 1):
+        template_cell = ws.cell(row=row, column=template_col)
+        target_cell = ws.cell(row=row, column=target_col)
+        if isinstance(target_cell, MergedCell):
+            continue
+        if template_cell.fill and template_cell.fill.fill_type == 'solid':
+            target_cell.fill = copy_obj(template_cell.fill)
+        if template_cell.number_format:
+            target_cell.number_format = template_cell.number_format
 
 
 def copy_template_sheet(wb, template_ws, title: str):
@@ -225,9 +260,16 @@ def fill_tabs(wb, products: List[ProductMappings]) -> int:
 
 def fill_columns(wb, products: List[ProductMappings]) -> int:
     ws = wb[find_template_sheet(wb)]
+    template_col = 3
+    data_start, data_end = find_data_row_range(ws, label_col=2)
     filled = 0
     for i, prod in enumerate(products):
-        filled += fill_sheet(ws, prod.mappings, force_col=3 + i)
+        target_col = 3 + i
+        fillable_mappings = [m for m in prod.mappings if fillable(m)]
+        strict = bool(fillable_mappings) and all(m.row is not None for m in fillable_mappings)
+        filled += fill_sheet(ws, prod.mappings, force_col=target_col, strict_rows=strict)
+        if target_col != template_col:
+            copy_column_format(ws, template_col, target_col, data_start, data_end)
     return filled
 
 
