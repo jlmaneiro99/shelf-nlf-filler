@@ -7,7 +7,7 @@ import openpyxl
 from openpyxl.styles import PatternFill
 from openpyxl.worksheet.datavalidation import DataValidation
 
-from main import FieldMapping, FillRequest, ProductFill, fill_nlf
+from main import FieldMapping, FillRequest, ProductMappings, fill_nlf
 
 GREEN = "FFEAF1DD"
 
@@ -31,8 +31,8 @@ def build_template() -> bytes:
     return out.getvalue()
 
 
-def product(name: str, rrp: str) -> ProductFill:
-    return ProductFill(
+def product(name: str, rrp: str) -> ProductMappings:
+    return ProductMappings(
         product_name=name,
         mappings=[
             FieldMapping(field_name="Product Name", mapped_value=name, status="filled", row=4, col="C"),
@@ -78,16 +78,57 @@ assert ws["C6"].value == "4.99" and ws["D6"].value == "5.49" and ws["E6"].value 
 assert wb.sheetnames == ["Product 1", "Additional", "C.O.O List"]
 print("columns mode OK — C/D/E filled")
 
-# --- legacy single-product payload ---
+# --- rows mode, horizontal template (header row + one row per product) ---
+def build_horizontal_template() -> bytes:
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "New Line"
+    ws["A1"] = "Some title"
+    headers = ["Product Name", "Brand", "RRP", "Vegan"]
+    for j, h in enumerate(headers, start=1):
+        ws.cell(row=3, column=j).value = h
+    out = io.BytesIO()
+    wb.save(out)
+    return out.getvalue()
+
+
+def rows_product(name: str, rrp: str) -> ProductMappings:
+    return ProductMappings(
+        product_name=name,
+        mappings=[
+            FieldMapping(field_name="Product Name", mapped_value=name, status="filled"),
+            FieldMapping(field_name="Brand", mapped_value="Nine Streets", status="filled"),
+            FieldMapping(field_name="RRP", mapped_value=rrp, status="filled"),
+            FieldMapping(field_name="Vegan", mapped_value="Yes", status="filled"),
+        ],
+    )
+
+
+req = FillRequest(
+    file_base64=base64.b64encode(build_horizontal_template()).decode(),
+    fill_mode="rows",
+    products=[rows_product("Granola A", "4.99"), rows_product("Granola B", "5.49")],
+    retailer_name="Generic",
+)
+res = asyncio.run(fill_nlf(req))
+wb = openpyxl.load_workbook(io.BytesIO(base64.b64decode(res["file_base64"])))
+ws = wb["New Line"]
+assert ws["A4"].value == "Granola A" and ws["C4"].value == "4.99", (ws["A4"].value, ws["C4"].value)
+assert ws["A5"].value == "Granola B" and ws["C5"].value == "5.49"
+assert res["fields_filled"] == 8, res
+print("rows mode OK — rows 4/5 filled under header row 3")
+
+# --- single product still works (no mode selector needed client-side) ---
 req = FillRequest(
     file_base64=base64.b64encode(build_template()).decode(),
-    mappings=product("Solo", "3.99").mappings,
-    product_name="Solo",
+    fill_mode="tabs",
+    products=[product("Solo", "3.99")],
     retailer_name="Suma",
 )
 res = asyncio.run(fill_nlf(req))
 wb = openpyxl.load_workbook(io.BytesIO(base64.b64decode(res["file_base64"])))
 assert wb["Product 1"]["C4"].value == "Solo"
+assert wb.sheetnames == ["Product 1", "Additional", "C.O.O List"]
 assert res["filename"].startswith("Suma_Solo_")
-print("legacy single-product OK —", res["filename"])
+print("single product OK —", res["filename"])
 print("ALL TESTS PASSED")
