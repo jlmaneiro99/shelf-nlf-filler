@@ -136,13 +136,13 @@ results.append(thr_ok)
 print()
 print('--- Integration tests ---')
 
-# Formula protection
+# Formula protection — value cell is empty; unrelated formula preserved
 wb = openpyxl.Workbook()
 ws = wb.active
 ws.title = 'Data'
 ws['A1'] = 5
-ws['B4'] = '=A1*2'
 ws['A4'] = 'Product Name'
+ws['C4'] = '=A1*2'
 file_bytes = io.BytesIO()
 wb.save(file_bytes)
 b64 = base64.b64encode(file_bytes.getvalue()).decode()
@@ -164,10 +164,43 @@ req = FillRequest(
 )
 res = asyncio.run(fill_nlf(req))
 out_wb = openpyxl.load_workbook(io.BytesIO(base64.b64decode(res['file_base64'])))
-formula_val = out_wb['Data']['B4'].value
-formula_ok = isinstance(formula_val, str) and formula_val.startswith('=')
-print(f'{"PASS" if formula_ok else "FAIL"} | Formula cell preserved: {formula_val!r}')
+formula_val = out_wb['Data']['C4'].value
+value_filled = out_wb['Data']['B4'].value == 'Test Item'
+formula_ok = isinstance(formula_val, str) and formula_val.startswith('=') and value_filled
+print(f'{"PASS" if formula_ok else "FAIL"} | Formula preserved + value filled: formula={formula_val!r} value={out_wb["Data"]["B4"].value!r}')
 results.append(formula_ok)
+
+# Formula write attempt → API refuses file (HTTP 500)
+wb_formula_target = openpyxl.Workbook()
+ws_ft = wb_formula_target.active
+ws_ft.title = 'Data'
+ws_ft['A1'] = 5
+ws_ft['A4'] = 'Product Name'
+ws_ft['B4'] = '=A1*2'
+file_bytes_ft = io.BytesIO()
+wb_formula_target.save(file_bytes_ft)
+b64_ft = base64.b64encode(file_bytes_ft.getvalue()).decode()
+req_ft = FillRequest(
+    file_base64=b64_ft,
+    products=[{'product_name': 'Blocked', 'allergen_details': [], 'certifications': []}],
+    retailer_name='Test',
+    form_spec={
+        'data_sheet': 'Data',
+        'layout': 'vertical',
+        'label_column': 1,
+        'value_column': 2,
+        'example_rows': [],
+        'other_sheets': [],
+        'field_map': [],
+    },
+)
+formula_refusal_ok = False
+try:
+    asyncio.run(fill_nlf(req_ft))
+except Exception as e:
+    formula_refusal_ok = 'Formula protection' in str(e)
+print(f'{"PASS" if formula_refusal_ok else "FAIL"} | Formula write attempt returns error (no file)')
+results.append(formula_refusal_ok)
 
 # Example row protection
 wb2 = openpyxl.Workbook()
@@ -246,6 +279,85 @@ after_count = count_formula_cells(after_wb)
 count_ok = after_count >= before_count and 'Lookup' in after_wb.sheetnames
 print(f'{"PASS" if count_ok else "FAIL"} | Formula count before={before_count} after={after_count}')
 results.append(count_ok)
+
+# Dundeis-style: 5 products, horizontal_rows, example row, Instructions sheet untouched
+wb5 = openpyxl.Workbook()
+ws5 = wb5.active
+ws5.title = 'New Lines'
+headers5 = ['Product Name', 'Brand', 'RRP', 'EAN Barcode (Unit)', 'Vegan']
+for col, hdr in enumerate(headers5, start=1):
+    ws5.cell(row=8, column=col).value = hdr
+ws5.cell(row=9, column=1).value = 'EXAMPLE - DO NOT EDIT'
+ws5.cell(row=9, column=2).value = 'Sample Brand'
+instr = wb5.create_sheet('Instructions')
+instr['A1'] = 'Do not modify this sheet'
+instr['B2'] = '=1+1'
+file_bytes5 = io.BytesIO()
+wb5.save(file_bytes5)
+b64_5 = base64.b64encode(file_bytes5.getvalue()).decode()
+products_5 = [
+    {'product_name': f'Product {i}', 'brand_name': 'Mi-Eco', 'rrp': 9.99 + i,
+     'ean_barcode': f'506000000000{i}', 'is_vegan': True,
+     'allergen_details': [], 'certifications': []}
+    for i in range(1, 6)
+]
+req5 = FillRequest(
+    file_base64=b64_5,
+    products=products_5,
+    retailer_name='Retailer_NLF_5_products',
+    fill_mode='auto',
+    form_spec={
+        'data_sheet': 'New Lines',
+        'layout': 'horizontal_rows',
+        'header_row': 8,
+        'first_data_row': 10,
+        'example_rows': [9],
+        'other_sheets': ['Instructions'],
+        'field_map': [],
+    },
+)
+res5 = asyncio.run(fill_nlf(req5))
+out5 = openpyxl.load_workbook(io.BytesIO(base64.b64decode(res5['file_base64'])))
+ws5_out = out5['New Lines']
+dundeis_ok = (
+    ws5_out.cell(row=9, column=1).value == 'EXAMPLE - DO NOT EDIT'
+    and ws5_out.cell(row=10, column=1).value == 'Product 1'
+    and ws5_out.cell(row=14, column=1).value == 'Product 5'
+    and ws5_out.cell(row=10, column=4).value == '5060000000001'
+    and ws5_out.cell(row=10, column=5).value == 'Yes'
+    and out5['Instructions']['A1'].value == 'Do not modify this sheet'
+    and str(out5['Instructions']['B2'].value).startswith('=')
+)
+print(f'{"PASS" if dundeis_ok else "FAIL"} | Dundeis 5-product horizontal_rows + example + Instructions sheet')
+results.append(dundeis_ok)
+
+print()
+print('--- Missing API key / Claude mock tests ---')
+
+import main as main_mod
+from unittest.mock import patch
+
+# Known fields fill without Anthropic; unknown stays blank
+saved_key = main_mod.ANTHROPIC_API_KEY
+main_mod.ANTHROPIC_API_KEY = None
+resolved_no_key = main_mod.resolve_values_for_labels(
+    ['THR Licensed', 'Brand Name', 'Comparative Unit'], TEST_PRODUCT,
+)
+no_key_ok = (
+    resolved_no_key.get('Brand Name') == 'TestBrand'
+    and 'THR Licensed' not in resolved_no_key
+    and 'Comparative Unit' not in resolved_no_key
+)
+main_mod.ANTHROPIC_API_KEY = saved_key
+print(f'{"PASS" if no_key_ok else "FAIL"} | Without API key: known filled, unknown blank')
+results.append(no_key_ok)
+
+# Mock Claude resolves unknown label when key would be used
+with patch.object(main_mod, 'claude_resolve_fields', return_value={'THR Licensed': 'No'}):
+    resolved_mock = main_mod.resolve_values_for_labels(['THR Licensed', 'Brand Name'], TEST_PRODUCT)
+mock_ok = resolved_mock.get('THR Licensed') == 'No' and resolved_mock.get('Brand Name') == 'TestBrand'
+print(f'{"PASS" if mock_ok else "FAIL"} | Mock Claude resolves unknown label')
+results.append(mock_ok)
 
 print()
 passed = sum(1 for r in results if r is True)

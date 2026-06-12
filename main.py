@@ -11,6 +11,13 @@ from copy import copy, deepcopy
 import datetime
 import os
 import re
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 import httpx
 
 app = FastAPI()
@@ -35,6 +42,15 @@ class FillRequest(BaseModel):
 
 
 ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY')
+
+
+class _FillGuard:
+    """Tracks blocked formula writes during a single /fill request."""
+    formula_blocks = 0
+
+    @classmethod
+    def reset(cls):
+        cls.formula_blocks = 0
 
 
 def is_formula_cell(cell):
@@ -64,6 +80,7 @@ def safe_write(ws, row, col, value):
                     rng.min_col <= col <= rng.max_col):
                 target = ws.cell(row=rng.min_row, column=rng.min_col)
                 if is_formula_cell(target):
+                    _FillGuard.formula_blocks += 1
                     return False
                 if len(str(value)) > 500:
                     value = str(value)[:500]
@@ -71,6 +88,7 @@ def safe_write(ws, row, col, value):
                 return True
         return False
     if is_formula_cell(cell):
+        _FillGuard.formula_blocks += 1
         return False
     if len(str(value)) > 500:
         value = str(value)[:500]
@@ -958,6 +976,7 @@ async def fill_nlf(req: FillRequest):
 
         file_bytes = base64.b64decode(req.file_base64)
         wb = openpyxl.load_workbook(io.BytesIO(file_bytes))
+        _FillGuard.reset()
         formula_count_before = count_formula_cells(wb)
 
         total_filled = 0
@@ -1081,6 +1100,14 @@ async def fill_nlf(req: FillRequest):
                     all_issues_fixed.extend(issues)
 
         formula_count_after = count_formula_cells(wb)
+        if _FillGuard.formula_blocks > 0:
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    f'Formula protection violation: blocked {_FillGuard.formula_blocks} '
+                    f'write attempt(s) to formula cells. File not returned.'
+                ),
+            )
         if formula_count_after < formula_count_before:
             raise HTTPException(
                 status_code=500,
