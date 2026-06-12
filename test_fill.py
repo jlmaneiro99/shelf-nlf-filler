@@ -7,7 +7,7 @@ import openpyxl
 from openpyxl.styles import PatternFill
 from openpyxl.worksheet.datavalidation import DataValidation
 
-from main import FillRequest, ProductFill, fill_nlf
+from main import FillRequest, fill_nlf
 
 GREEN = "FFEAF1DD"
 
@@ -31,16 +31,16 @@ def build_template() -> bytes:
     return out.getvalue()
 
 
-def product(name: str, rrp: str) -> ProductFill:
-    return ProductFill(
-        product_name=name,
-        product_data={
-            'product_name': name,
-            'brand_name': 'Nine Streets',
-            'rrp': rrp,
-            'is_vegan': True,
-        },
-    )
+def product(name: str, rrp: str) -> dict:
+    return {
+        'product_name': name,
+        'brand_name': 'Nine Streets',
+        'rrp': rrp,
+        'is_vegan': True,
+        'allergen_details': [],
+        'certifications': [],
+        'suitable_for': [],
+    }
 
 
 def run(mode: str, products):
@@ -133,7 +133,7 @@ def build_merged_template() -> bytes:
 req = FillRequest(
     file_base64=base64.b64encode(build_merged_template()).decode(),
     fill_mode="tabs",
-    products=[ProductFill(product_name="Merged Test", product_data={'product_name': 'Merged Test', 'brand_name': 'Nine Streets'})],
+    products=[product("Merged Test", "3.99")],
     retailer_name="Retailer",
 )
 res = asyncio.run(fill_nlf(req))
