@@ -7,7 +7,7 @@ import openpyxl
 from openpyxl.styles import PatternFill
 from openpyxl.worksheet.datavalidation import DataValidation
 
-from main import FieldMapping, FillRequest, ProductMappings, fill_nlf
+from main import FillRequest, ProductFill, fill_nlf
 
 GREEN = "FFEAF1DD"
 
@@ -31,16 +31,15 @@ def build_template() -> bytes:
     return out.getvalue()
 
 
-def product(name: str, rrp: str) -> ProductMappings:
-    return ProductMappings(
+def product(name: str, rrp: str) -> ProductFill:
+    return ProductFill(
         product_name=name,
-        mappings=[
-            FieldMapping(field_name="Product Name", mapped_value=name, status="filled", row=4, col="C"),
-            FieldMapping(field_name="Brand", mapped_value="Nine Streets", status="filled"),
-            FieldMapping(field_name="RRP", mapped_value=rrp, status="filled"),
-            FieldMapping(field_name="Vegan", mapped_value="Yes", status="filled"),
-            FieldMapping(field_name="Unknown Field", mapped_value=None, status="missing"),
-        ],
+        product_data={
+            'product_name': name,
+            'brand_name': 'Nine Streets',
+            'rrp': rrp,
+            'is_vegan': True,
+        },
     )
 
 
@@ -56,7 +55,6 @@ def run(mode: str, products):
     return res, wb
 
 
-# --- tabs mode, 3 products ---
 res, wb = run("tabs", [product("Granola A", "4.99"), product("Granola B", "5.49"), product("Granola C", "5.99")])
 assert res["fields_filled"] == 12, res
 assert wb.sheetnames == ["Product 1", "Product 2", "Product 3", "Additional", "C.O.O List"], wb.sheetnames
@@ -69,7 +67,6 @@ for sheet, name, rrp in [("Product 1", "Granola A", "4.99"), ("Product 2", "Gran
     assert len(dvs) == 1 and dvs[0].formula1 == '"Yes,No"', (sheet, dvs)
 print("tabs mode OK — sheets:", wb.sheetnames)
 
-# --- columns mode, 3 products ---
 res, wb = run("columns", [product("Granola A", "4.99"), product("Granola B", "5.49"), product("Granola C", "5.99")])
 assert res["fields_filled"] == 12, res
 ws = wb["Product 1"]
@@ -78,7 +75,7 @@ assert ws["C6"].value == "4.99" and ws["D6"].value == "5.49" and ws["E6"].value 
 assert wb.sheetnames == ["Product 1", "Additional", "C.O.O List"]
 print("columns mode OK — C/D/E filled")
 
-# --- rows mode, horizontal template (header row + one row per product) ---
+
 def build_horizontal_template() -> bytes:
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -92,22 +89,10 @@ def build_horizontal_template() -> bytes:
     return out.getvalue()
 
 
-def rows_product(name: str, rrp: str) -> ProductMappings:
-    return ProductMappings(
-        product_name=name,
-        mappings=[
-            FieldMapping(field_name="Product Name", mapped_value=name, status="filled"),
-            FieldMapping(field_name="Brand", mapped_value="Nine Streets", status="filled"),
-            FieldMapping(field_name="RRP", mapped_value=rrp, status="filled"),
-            FieldMapping(field_name="Vegan", mapped_value="Yes", status="filled"),
-        ],
-    )
-
-
 req = FillRequest(
     file_base64=base64.b64encode(build_horizontal_template()).decode(),
     fill_mode="rows",
-    products=[rows_product("Granola A", "4.99"), rows_product("Granola B", "5.49")],
+    products=[product("Granola A", "4.99"), product("Granola B", "5.49")],
     retailer_name="Generic",
 )
 res = asyncio.run(fill_nlf(req))
@@ -118,7 +103,6 @@ assert ws["A5"].value == "Granola B" and ws["C5"].value == "5.49"
 assert res["fields_filled"] == 8, res
 print("rows mode OK — rows 4/5 filled under header row 3")
 
-# --- single product still works (no mode selector needed client-side) ---
 req = FillRequest(
     file_base64=base64.b64encode(build_template()).decode(),
     fill_mode="tabs",
@@ -132,7 +116,7 @@ assert wb.sheetnames == ["Product 1", "Additional", "C.O.O List"]
 assert res["filename"].startswith("Suma_Solo_")
 print("single product OK —", res["filename"])
 
-# --- merged cells in value column ---
+
 def build_merged_template() -> bytes:
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -149,15 +133,7 @@ def build_merged_template() -> bytes:
 req = FillRequest(
     file_base64=base64.b64encode(build_merged_template()).decode(),
     fill_mode="tabs",
-    products=[
-        ProductMappings(
-            product_name="Merged Test",
-            mappings=[
-                FieldMapping(field_name="Product Name", mapped_value="Merged Test", status="filled"),
-                FieldMapping(field_name="Brand", mapped_value="Nine Streets", status="filled"),
-            ],
-        )
-    ],
+    products=[ProductFill(product_name="Merged Test", product_data={'product_name': 'Merged Test', 'brand_name': 'Nine Streets'})],
     retailer_name="Retailer",
 )
 res = asyncio.run(fill_nlf(req))

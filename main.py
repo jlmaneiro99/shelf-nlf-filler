@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple
 from copy import deepcopy, copy as copy_obj
 import base64
 import io
@@ -10,6 +10,8 @@ import openpyxl
 from openpyxl.cell.cell import MergedCell
 import datetime
 import os
+
+from field_mapper import map_field_to_value, should_skip_label
 
 app = FastAPI()
 
@@ -21,35 +23,16 @@ app.add_middleware(
 )
 
 
-class FieldMapping(BaseModel):
-    field_name: str
-    mapped_value: Optional[str] = None
-    status: str
-    row: Optional[int] = None
-    col: Optional[Union[int, str]] = None
-
-
-class ProductMappings(BaseModel):
+class ProductFill(BaseModel):
     product_name: str
-    mappings: List[FieldMapping]
+    product_data: Dict[str, Any]
 
 
 class FillRequest(BaseModel):
     file_base64: str
     fill_mode: str = 'tabs'  # 'tabs' | 'columns' | 'rows'
-    products: List[ProductMappings]
+    products: List[ProductFill]
     retailer_name: str
-
-
-def col_letter_to_index(col: str) -> int:
-    n = 0
-    for ch in col.upper():
-        n = n * 26 + (ord(ch) - 64)
-    return n
-
-
-def norm(label) -> str:
-    return str(label).strip().lower()
 
 
 def safe_write(ws, row_num: int, col: int, value) -> None:
@@ -106,94 +89,38 @@ def find_template_sheet(wb) -> str:
     return product_sheet
 
 
-def build_label_map(ws) -> Dict[str, Tuple[int, int]]:
-    """Map normalised field labels to (row, label_column). Skips merged cells."""
-    label_map: Dict[str, Tuple[int, int]] = {}
+def fill_sheet(
+    ws,
+    product_data: Dict[str, Any],
+    value_col: Optional[int] = None,
+    label_col: Optional[int] = None,
+) -> int:
+    """Match field labels to product values and write to the adjacent value cell."""
+    filled = 0
+
     for row in ws.iter_rows():
         for cell in row:
             if isinstance(cell, MergedCell):
                 continue
-            if cell.value:
-                label = norm(cell.value)
-                if label and label not in label_map:
-                    label_map[label] = (cell.row, cell.column)
-    return label_map
-
-
-def resolve_label_pos(
-    mapping: FieldMapping, label_map: Dict[str, Tuple[int, int]]
-) -> Optional[Tuple[int, int]]:
-    search = norm(mapping.field_name)
-    pos = label_map.get(search)
-    if pos is None:
-        for label, candidate in label_map.items():
-            if search in label or label in search:
-                pos = candidate
-                break
-    return pos
-
-
-def fillable(mapping: FieldMapping) -> bool:
-    return bool(mapping.mapped_value) and mapping.status != 'missing'
-
-
-def resolve_col_index(mapping: FieldMapping, force_col: Optional[int] = None) -> Optional[int]:
-    if mapping.col is not None:
-        if isinstance(mapping.col, int):
-            return mapping.col
-        return col_letter_to_index(str(mapping.col))
-    return force_col
-
-
-def fill_sheet(
-    ws,
-    mappings: List[FieldMapping],
-    force_col: Optional[int] = None,
-    strict_coords: bool = False,
-) -> int:
-    """Pure writer: use row+col coordinates when provided; label fallback otherwise."""
-    label_map = build_label_map(ws)
-    filled = 0
-
-    for mapping in mappings:
-        if not fillable(mapping):
-            continue
-
-        # Direct coordinate write — trust Claude row; allow force_col to override column in columns mode
-        if mapping.row is not None and (mapping.col is not None or force_col is not None):
-            col_idx = force_col if force_col is not None else resolve_col_index(mapping)
-            if col_idx is not None:
-                safe_write(ws, mapping.row, col_idx, mapping.mapped_value)
-                filled += 1
-            continue
-
-        if strict_coords:
-            continue
-
-        row_num: Optional[int] = None
-        value_col: Optional[int] = None
-
-        if mapping.row:
-            row_num = mapping.row
-            value_col = resolve_col_index(mapping, force_col) or 3
-        else:
-            pos = resolve_label_pos(mapping, label_map)
-            if pos is None:
+            if cell.value is None:
                 continue
-            row_num, label_col = pos
-            value_col = force_col if force_col is not None else label_col + 1
+            if label_col is not None and cell.column != label_col:
+                continue
 
-        if row_num is None or value_col is None:
-            continue
+            field_label = str(cell.value).strip()
+            if should_skip_label(field_label):
+                continue
 
-        safe_write(ws, row_num, value_col, mapping.mapped_value)
-        filled += 1
+            value = map_field_to_value(field_label, product_data)
+            if value is not None and value != '':
+                target_col = value_col if value_col is not None else cell.column + 1
+                safe_write(ws, cell.row, target_col, value)
+                filled += 1
 
     return filled
 
 
 def find_data_row_range(ws, label_col: int = 2) -> Tuple[int, int]:
-    """First and last rows with field labels in the label column."""
     start: Optional[int] = None
     end: Optional[int] = None
     for row in ws.iter_rows():
@@ -208,7 +135,6 @@ def find_data_row_range(ws, label_col: int = 2) -> Tuple[int, int]:
 
 
 def copy_column_format(ws, template_col: int, target_col: int, data_start_row: int, data_end_row: int) -> None:
-    """Copy solid fill (and number format) from template product column to target column."""
     for row in range(data_start_row, data_end_row + 1):
         template_cell = ws.cell(row=row, column=template_col)
         target_cell = ws.cell(row=row, column=target_col)
@@ -221,8 +147,6 @@ def copy_column_format(ws, template_col: int, target_col: int, data_start_row: i
 
 
 def copy_template_sheet(wb, template_ws, title: str):
-    """Copy the template sheet (openpyxl's copy_worksheet does not copy
-    data validations, so dropdowns are re-added manually)."""
     new_ws = wb.copy_worksheet(template_ws)
     new_ws.title = title
     for dv in template_ws.data_validations.dataValidation:
@@ -231,7 +155,6 @@ def copy_template_sheet(wb, template_ws, title: str):
 
 
 def find_header_row(ws, scan_rows: int = 30) -> int:
-    """Header row = the row with the most non-empty cells (horizontal NLFs)."""
     best_row, best_count = 1, 0
     max_row = min(scan_rows, ws.max_row or scan_rows)
     for row in ws.iter_rows(min_row=1, max_row=max_row):
@@ -249,7 +172,6 @@ PRODUCT_HEADER_RE = re.compile(r'^PRODUCT\s+(\d+)\s*$', re.I)
 
 
 def find_product_header_info(ws, scan_rows: int = 15) -> Tuple[Optional[int], Optional[int], int]:
-    """Return (header_row, first_product_col, max_existing_product_num) from PRODUCT X labels."""
     for row in range(1, scan_rows + 1):
         found: List[Tuple[int, int]] = []
         for col in range(1, 40):
@@ -280,7 +202,6 @@ def ensure_product_column_header(
     first_product_col: int,
     product_num: int,
 ) -> None:
-    """Write PRODUCT N header and sub-header for columns beyond the template."""
     target_col = first_product_col + product_num - 1
     template_header_cell = ws.cell(row=header_row, column=first_product_col)
     template_sub_cell = ws.cell(row=header_row + 1, column=first_product_col)
@@ -297,7 +218,7 @@ def ensure_product_column_header(
         copy_cell_style(template_sub_cell, sub_cell)
 
 
-def fill_tabs(wb, products: List[ProductMappings]) -> int:
+def fill_tabs(wb, products: List[ProductFill]) -> int:
     template_name = find_template_sheet(wb)
     template_ws = wb[template_name]
     template_idx = wb.sheetnames.index(template_name)
@@ -313,11 +234,11 @@ def fill_tabs(wb, products: List[ProductMappings]) -> int:
                 ws = copy_template_sheet(wb, template_ws, target_name)
                 current_idx = wb.sheetnames.index(ws.title)
                 wb.move_sheet(ws.title, offset=(template_idx + i) - current_idx)
-        filled += fill_sheet(ws, prod.mappings)
+        filled += fill_sheet(ws, prod.product_data, label_col=2)
     return filled
 
 
-def fill_columns(wb, products: List[ProductMappings]) -> int:
+def fill_columns(wb, products: List[ProductFill]) -> int:
     ws = wb[find_template_sheet(wb)]
     template_col = 3
     data_start, data_end = find_data_row_range(ws, label_col=2)
@@ -328,18 +249,13 @@ def fill_columns(wb, products: List[ProductMappings]) -> int:
         product_num = i + 1
         if header_row and first_product_col and product_num > max_existing_products:
             ensure_product_column_header(ws, header_row, first_product_col, product_num)
-        fillable_mappings = [m for m in prod.mappings if fillable(m)]
-        has_rows = bool(fillable_mappings) and all(m.row is not None for m in fillable_mappings)
-        if has_rows:
-            filled += fill_sheet(ws, prod.mappings, force_col=target_col, strict_coords=True)
-        else:
-            filled += fill_sheet(ws, prod.mappings, force_col=target_col)
+        filled += fill_sheet(ws, prod.product_data, value_col=target_col, label_col=2)
         if target_col != template_col:
             copy_column_format(ws, template_col, target_col, data_start, data_end)
     return filled
 
 
-def fill_rows(wb, products: List[ProductMappings]) -> int:
+def fill_rows(wb, products: List[ProductFill]) -> int:
     ws = wb[find_template_sheet(wb)]
     header_row = find_header_row(ws)
 
@@ -348,20 +264,14 @@ def fill_rows(wb, products: List[ProductMappings]) -> int:
         if isinstance(cell, MergedCell):
             continue
         if cell.value not in (None, ''):
-            col_to_field[cell.column] = norm(cell.value)
+            col_to_field[cell.column] = str(cell.value)
 
     filled = 0
     for i, prod in enumerate(products):
         row_num = header_row + 1 + i
-        values = {norm(m.field_name): m.mapped_value for m in prod.mappings if fillable(m)}
         for col_idx, field_label in col_to_field.items():
-            value = values.get(field_label)
-            if value is None:
-                for name, v in values.items():
-                    if name in field_label or field_label in name:
-                        value = v
-                        break
-            if value is not None:
+            value = map_field_to_value(field_label, prod.product_data)
+            if value is not None and value != '':
                 safe_write(ws, row_num, col_idx, value)
                 filled += 1
     return filled
