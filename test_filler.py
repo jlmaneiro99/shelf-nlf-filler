@@ -338,17 +338,15 @@ import main as main_mod
 from unittest.mock import patch
 
 # Known fields fill without Anthropic; unknown stays blank
-saved_key = main_mod.ANTHROPIC_API_KEY
-main_mod.ANTHROPIC_API_KEY = None
-resolved_no_key = main_mod.resolve_values_for_labels(
-    ['THR Licensed', 'Brand Name', 'Comparative Unit'], TEST_PRODUCT,
-)
+with patch.object(main_mod, 'get_anthropic_api_key', return_value=None):
+    resolved_no_key = main_mod.resolve_values_for_labels(
+        ['THR Licensed', 'Brand Name', 'Comparative Unit'], TEST_PRODUCT,
+    )
 no_key_ok = (
     resolved_no_key.get('Brand Name') == 'TestBrand'
     and 'THR Licensed' not in resolved_no_key
     and 'Comparative Unit' not in resolved_no_key
 )
-main_mod.ANTHROPIC_API_KEY = saved_key
 print(f'{"PASS" if no_key_ok else "FAIL"} | Without API key: known filled, unknown blank')
 results.append(no_key_ok)
 

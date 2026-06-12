@@ -40,9 +40,11 @@ uvicorn main:app --reload
 
 Supabase Edge Function `nlf-mapper` uses the same `ANTHROPIC_API_KEY` secret (Dashboard → Edge Functions → Secrets) for FormSpec analysis.
 
-## Tests
+## Live verification (Railway)
 
 ```bash
-python3 test_filler.py   # 50+ unit + integration tests
-python3 test_fill.py     # tabs / columns / rows smoke tests
+python3 verify_live_railway.py
+# Uses VITE_NLF_FILLER_URL from ../.env or defaults to production URL
 ```
+
+Checks `/health`, `/health/config` (anthropic_key_present), and a live `/fill` with Claude fallback.

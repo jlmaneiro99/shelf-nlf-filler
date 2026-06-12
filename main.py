@@ -41,7 +41,27 @@ class FillRequest(BaseModel):
     form_spec: Optional[Dict[str, Any]] = None
 
 
-ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY')
+def get_anthropic_api_key() -> Optional[str]:
+    """Read at call time so Railway env vars apply after redeploy without stale cache."""
+    key = os.environ.get('ANTHROPIC_API_KEY')
+    if key and str(key).strip():
+        return str(key).strip()
+    return None
+
+
+def anthropic_config_status() -> Dict[str, Any]:
+    key = get_anthropic_api_key()
+    httpx_ok = False
+    try:
+        import httpx as _httpx  # noqa: F401
+        httpx_ok = True
+    except ImportError:
+        pass
+    return {
+        'anthropic_key_present': bool(key),
+        'anthropic_key_source': 'env' if key else None,
+        'anthropic_client_available': httpx_ok,
+    }
 
 
 class _FillGuard:
@@ -132,7 +152,8 @@ def has_cert(p, *keywords):
 
 
 def claude_resolve_fields(unresolved_labels, product):
-    if not ANTHROPIC_API_KEY or not unresolved_labels:
+    api_key = get_anthropic_api_key()
+    if not api_key or not unresolved_labels:
         return {}
     unique_labels = list(dict.fromkeys(unresolved_labels))
     prompt = f'''You are an expert FMCG sales manager filling a retailer New Line Form. For each form field label below, return the correct value from the product data, exactly as an experienced human would write it.
@@ -157,7 +178,7 @@ Return ONLY JSON: {{"label": "value", ...}}'''
         resp = httpx.post(
             'https://api.anthropic.com/v1/messages',
             headers={
-                'x-api-key': ANTHROPIC_API_KEY,
+                'x-api-key': api_key,
                 'anthropic-version': '2023-06-01',
                 'content-type': 'application/json',
             },
@@ -169,7 +190,13 @@ Return ONLY JSON: {{"label": "value", ...}}'''
             },
             timeout=60,
         )
-        text = resp.json()['content'][0]['text']
+        if resp.status_code != 200:
+            return {}
+        data = resp.json()
+        content = data.get('content') or []
+        if not content:
+            return {}
+        text = content[0].get('text', '')
         text = text.strip()
         if text.startswith('```json'):
             text = text[7:]
@@ -1136,6 +1163,7 @@ async def fill_nlf(req: FillRequest):
             "products_filled": len(req.products),
             "fill_mode": req.fill_mode,
             "verification_issues_fixed": len(all_issues_fixed),
+            "anthropic_key_present": bool(get_anthropic_api_key()),
         }
 
     except HTTPException:
@@ -1148,6 +1176,12 @@ async def fill_nlf(req: FillRequest):
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+@app.get("/health/config")
+async def health_config():
+    """Safe diagnostics — booleans only, never secret values."""
+    return anthropic_config_status()
 
 
 if __name__ == "__main__":
