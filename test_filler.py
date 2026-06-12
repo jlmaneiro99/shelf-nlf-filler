@@ -1,5 +1,23 @@
 import json
-from main import map_field, safe_str, is_allergen_field
+import asyncio
+import base64
+import io
+
+import openpyxl
+from openpyxl.cell.cell import MergedCell
+
+from main import (
+    map_field,
+    safe_str,
+    is_allergen_field,
+    safe_write,
+    is_formula_cell,
+    count_formula_cells,
+    fill_horizontal_rows,
+    fill_using_form_spec,
+    FillRequest,
+    fill_nlf,
+)
 
 TEST_PRODUCT = {
     'product_name': 'Test Protein Powder',
@@ -104,8 +122,133 @@ results.append(test('Eggs', 'Not Present'))
 results.append(test('Peanuts', 'Not Present'))
 results.append(test('Cereals Containing Gluten', 'Not Present'))
 
+# Conservative compliance — NASAA must not infer from generic Organic
+nasaa_product = {**TEST_PRODUCT, 'is_organic': True, 'certifications': ['Organic', 'Vegan']}
+results.append(test('NASAA Organic', 'No', product=nasaa_product))
+results.append(test('Australian Certified Organic', 'No', product=nasaa_product))
+
+# Unknown label returns None (Claude fallback candidate)
+thr = map_field('THR Licensed', TEST_PRODUCT)
+thr_ok = thr is None
+print(f'{"PASS" if thr_ok else "FAIL"} | "THR Licensed" → got "{thr}" expected None')
+results.append(thr_ok)
+
 print()
-passed = sum(results)
+print('--- Integration tests ---')
+
+# Formula protection
+wb = openpyxl.Workbook()
+ws = wb.active
+ws.title = 'Data'
+ws['A1'] = 5
+ws['B4'] = '=A1*2'
+ws['A4'] = 'Product Name'
+file_bytes = io.BytesIO()
+wb.save(file_bytes)
+b64 = base64.b64encode(file_bytes.getvalue()).decode()
+
+req = FillRequest(
+    file_base64=b64,
+    products=[{'product_name': 'Test Item', 'allergen_details': [], 'certifications': []}],
+    retailer_name='Test',
+    fill_mode='auto',
+    form_spec={
+        'data_sheet': 'Data',
+        'layout': 'vertical',
+        'label_column': 1,
+        'value_column': 2,
+        'example_rows': [],
+        'other_sheets': [],
+        'field_map': [],
+    },
+)
+res = asyncio.run(fill_nlf(req))
+out_wb = openpyxl.load_workbook(io.BytesIO(base64.b64decode(res['file_base64'])))
+formula_val = out_wb['Data']['B4'].value
+formula_ok = isinstance(formula_val, str) and formula_val.startswith('=')
+print(f'{"PASS" if formula_ok else "FAIL"} | Formula cell preserved: {formula_val!r}')
+results.append(formula_ok)
+
+# Example row protection
+wb2 = openpyxl.Workbook()
+ws2 = wb2.active
+ws2.title = 'Sheet1'
+for col, hdr in enumerate(['Product Name', 'Brand', 'RRP'], start=1):
+    ws2.cell(row=8, column=col).value = hdr
+ws2.cell(row=9, column=1).value = 'EXAMPLE PRODUCT'
+ws2.cell(row=9, column=2).value = 'Demo Brand'
+ws2.cell(row=9, column=3).value = '9.99'
+file_bytes2 = io.BytesIO()
+wb2.save(file_bytes2)
+b64_2 = base64.b64encode(file_bytes2.getvalue()).decode()
+
+products_3 = [
+    {'product_name': f'Product {i}', 'brand_name': 'BrandX', 'rrp': 10 + i,
+     'allergen_details': [], 'certifications': []}
+    for i in range(1, 4)
+]
+req2 = FillRequest(
+    file_base64=b64_2,
+    products=products_3,
+    retailer_name='Dundeis',
+    fill_mode='auto',
+    form_spec={
+        'data_sheet': 'Sheet1',
+        'layout': 'horizontal_rows',
+        'header_row': 8,
+        'first_data_row': 10,
+        'example_rows': [9],
+        'other_sheets': [],
+        'field_map': [],
+    },
+)
+res2 = asyncio.run(fill_nlf(req2))
+out2 = openpyxl.load_workbook(io.BytesIO(base64.b64decode(res2['file_base64'])))
+ws_out = out2['Sheet1']
+example_preserved = ws_out.cell(row=9, column=1).value == 'EXAMPLE PRODUCT'
+row10 = ws_out.cell(row=10, column=1).value == 'Product 1'
+row11 = ws_out.cell(row=11, column=1).value == 'Product 2'
+row12 = ws_out.cell(row=12, column=1).value == 'Product 3'
+example_ok = example_preserved and row10 and row11 and row12
+print(f'{"PASS" if example_ok else "FAIL"} | Example row untouched + products at 10/11/12')
+results.append(example_ok)
+
+# Formula count unchanged with VLOOKUP sheet
+wb3 = openpyxl.Workbook()
+ws_data = wb3.active
+ws_data.title = 'Product 1'
+ws_data['A4'] = 'Product Name'
+ws_data['B4'] = 'Brand'
+ws_data['A5'] = 'Full Product Name'
+ws_lookup = wb3.create_sheet('Lookup')
+ws_lookup['A1'] = '=VLOOKUP("x",Product_1!A:B,2,FALSE)'
+file_bytes3 = io.BytesIO()
+wb3.save(file_bytes3)
+before_count = count_formula_cells(openpyxl.load_workbook(io.BytesIO(file_bytes3.getvalue())))
+b64_3 = base64.b64encode(file_bytes3.getvalue()).decode()
+req3 = FillRequest(
+    file_base64=b64_3,
+    products=[{'product_name': 'Safe Fill', 'brand_name': 'Co', 'allergen_details': [], 'certifications': []}],
+    retailer_name='Test',
+    form_spec={
+        'data_sheet': 'Product 1',
+        'layout': 'vertical',
+        'label_column': 1,
+        'value_column': 2,
+        'other_sheets': ['Lookup'],
+        'example_rows': [],
+        'field_map': [],
+    },
+)
+res3 = asyncio.run(fill_nlf(req3))
+after_wb = openpyxl.load_workbook(io.BytesIO(base64.b64decode(res3['file_base64'])))
+after_count = count_formula_cells(after_wb)
+count_ok = after_count >= before_count and 'Lookup' in after_wb.sheetnames
+print(f'{"PASS" if count_ok else "FAIL"} | Formula count before={before_count} after={after_count}')
+results.append(count_ok)
+
+print()
+passed = sum(1 for r in results if r is True)
 total = len(results)
 print(f'RESULT: {passed}/{total} tests passed')
 if passed < total:
