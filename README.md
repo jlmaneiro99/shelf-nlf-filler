@@ -34,11 +34,37 @@ uvicorn main:app --reload
 
 ## Deploy (Railway)
 
-1. Connect this repo to Railway (`shelf-nlf-filler`)
-2. **Variables → New Variable:** `ANTHROPIC_API_KEY` = your Anthropic secret key
-3. Deploy; copy the service URL into the main app `.env` as `VITE_NLF_FILLER_URL`
+Backend service: **`shelf-nlf-filler`** → `https://shelf-nlf-filler-production.up.railway.app`
 
-Supabase Edge Function `nlf-mapper` uses the same `ANTHROPIC_API_KEY` secret (Dashboard → Edge Functions → Secrets) for FormSpec analysis.
+The frontend (`VITE_NLF_FILLER_URL`) only points at this URL — **do not** put `ANTHROPIC_API_KEY` in the frontend or root `.env` for Vite.
+
+### Set Anthropic key on the backend service
+
+1. [railway.app](https://railway.app) → project → service **`shelf-nlf-filler`** (Python/Dockerfile, not a static site)
+2. **Variables** → **Production** environment
+3. Add **`ANTHROPIC_API_KEY`** (exact name, no `VITE_` prefix)
+4. **Deploy** → Redeploy latest (required after adding/changing variables)
+
+Verify without guessing:
+
+```bash
+curl -s https://shelf-nlf-filler-production.up.railway.app/health/config
+# Expect: {"anthropic_key_present":true,"anthropic_key_source":"env",...}
+```
+
+Or CLI (after `railway login` and linking this repo):
+
+```bash
+./scripts/sync_railway_anthropic.sh
+python3 verify_live_railway.py
+```
+
+## Tests
+
+```bash
+python3 test_filler.py   # 54 unit + integration tests
+python3 test_fill.py     # tabs / columns / rows smoke tests
+```
 
 ## Live verification (Railway)
 

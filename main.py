@@ -57,10 +57,16 @@ def anthropic_config_status() -> Dict[str, Any]:
         httpx_ok = True
     except ImportError:
         pass
+    # Names only — helps detect typos like CLAUDE_API_KEY without exposing values
+    related_env_keys = sorted(
+        k for k in os.environ
+        if any(x in k.upper() for x in ('ANTHROPIC', 'CLAUDE', 'OPENAI'))
+    )
     return {
         'anthropic_key_present': bool(key),
         'anthropic_key_source': 'env' if key else None,
         'anthropic_client_available': httpx_ok,
+        'related_env_keys_present': related_env_keys,
     }
 
 
