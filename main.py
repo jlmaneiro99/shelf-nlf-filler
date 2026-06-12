@@ -9,6 +9,7 @@ from openpyxl.cell.cell import MergedCell
 from copy import copy, deepcopy
 import datetime
 import os
+import re
 
 app = FastAPI()
 app.add_middleware(
@@ -63,6 +64,15 @@ ALLERGEN_KEYS = [
 ]
 
 
+def safe_str(value, default='N/A'):
+    if value is None:
+        return default
+    s = str(value).strip()
+    if s == '' or s == 'None' or s == 'null':
+        return default
+    return s
+
+
 def get_allergen_value(label, allergen_details):
     if not allergen_details:
         return 'Not Present'
@@ -82,6 +92,14 @@ def get_allergen_value(label, allergen_details):
 
 def is_allergen_field(label):
     label_lower = label.lower()
+    if 'gluten free' in label_lower or 'gluten-free' in label_lower:
+        return False
+    if 'free from' in label_lower:
+        return False
+    if 'dairy free' in label_lower or 'nut free' in label_lower:
+        return False
+    if 'soy free' in label_lower or 'soya free' in label_lower:
+        return False
     for _, keywords in ALLERGEN_KEYS:
         if any(kw in label_lower for kw in keywords):
             return True
@@ -120,16 +138,16 @@ def map_field(label_raw, product):
                                   'product name', 'name of product',
                                   'article name', 'item name',
                                   'product title']) and 'description' not in label:
-        return str(p.get('product_name', ''))
+        return safe_str(p.get('product_name'), '')
 
     if label in ['brand name', 'brand', 'brand / manufacturer',
                  'manufacturer', 'manufacturer name', 'brand name *']:
-        return str(p.get('brand_name', ''))
+        return safe_str(p.get('brand_name'), '')
 
     if any(x in label for x in ['supplier name', 'supplier / company',
                                   'company name', 'vendor name',
                                   'supplier company']):
-        return str(p.get('supplier_name') or p.get('brand_name', ''))
+        return safe_str(p.get('supplier_name') or p.get('brand_name'), '')
 
     if any(x in label for x in ['sku', 'supplier code', 'supplier reference',
                                   'reference code', 'supplier ref',
@@ -137,106 +155,107 @@ def map_field(label_raw, product):
                                   'article number', 'item code',
                                   'product code', 'supplier item code',
                                   'commodity code']) and 'hs' not in label and 'tariff' not in label:
-        return str(p.get('sku_code', ''))
+        return safe_str(p.get('sku_code'), '')
 
     if any(x in label for x in ['case barcode', 'outer barcode',
                                   'case ean', 'shipper barcode',
                                   'carton barcode', 'case gtin',
-                                  'case upc', 'outer ean']):
-        return str(p.get('case_barcode', '')) or 'N/A'
+                                  'case upc', 'outer ean',
+                                  'upc barcode case', 'barcode case',
+                                  'barcode — case']):
+        return safe_str(p.get('case_barcode'))
 
     if any(x in label for x in ['ean', 'barcode', 'gtin', 'upc',
                                   'unit barcode', 'individual barcode',
+                                  'individual unit barcode',
                                   'product barcode', 'item barcode',
                                   'unit ean', 'unit gtin']):
-        return str(p.get('ean_barcode', ''))
+        return safe_str(p.get('ean_barcode'), '')
 
     if any(x in label for x in ['variant', 'pack size', 'product size',
                                   'size / format', 'format', 'pack format']):
-        return str(p.get('variant', ''))
+        return safe_str(p.get('variant'), '')
 
     if 'product description' in label and 'usp' not in label and 'sell' not in label:
-        return str(p.get('product_description', ''))
+        return safe_str(p.get('product_description'), '')
 
     if any(x in label for x in ['usp', 'key claims', 'unique selling',
                                   'selling point', 'key benefit',
                                   'product claim', 'about the product',
                                   'sell copy', 'marketing description',
                                   'consumer description', 'website description']):
-        return str(p.get('usp', ''))
+        return safe_str(p.get('usp'), '')
 
     if 'ingredient' in label:
-        return str(p.get('ingredients', '')) or 'N/A'
+        return safe_str(p.get('ingredients'))
 
     if any(x in label for x in ['how will you promote', 'promotional plan',
                                   'promotional support', 'promotional activity',
                                   'marketing support', 'trade support',
                                   'marketing plan', 'consumer marketing',
                                   'promotion plan', 'how do you plan to market']):
-        return str(p.get('promotion_plan', '')) or 'N/A'
+        return safe_str(p.get('promotion_plan'))
 
     if any(x in label for x in ['rrp', 'retail price', 'recommended retail',
                                   'msrp', 'normal rrp', 'consumer price',
                                   'selling price', 'shelf price']):
-        return str(p.get('rrp', ''))
+        return safe_str(p.get('rrp'), '')
 
     if any(x in label for x in ['wholesale price', 'trade price',
                                   'cost to', 'normal trade price',
                                   'invoice price', 'supply price',
                                   'ex-works price', 'unit cost to retailer',
                                   'buying price', 'net price']):
-        return str(p.get('trade_price_per_case', ''))
+        return safe_str(p.get('trade_price_per_case'), '')
 
     if any(x in label for x in ['cost price', 'landed cost',
                                   'our cost']) and 'wholesale' not in label:
-        return str(p.get('cost_price_per_case', '')) or 'N/A'
+        return safe_str(p.get('cost_price_per_case'))
 
     if any(x in label for x in ['units per case', 'units/case',
                                   'case quantity', 'qty per case',
                                   'pieces per case', 'count per case',
                                   'units per outer']):
-        return str(p.get('units_per_case', ''))
+        return safe_str(p.get('units_per_case'), '')
 
     if any(x in label for x in ['case size description', 'case configuration',
                                   'pack configuration', 'pack description',
                                   'case contents', 'case format']) or \
        ('case size' in label and any(x in label for x in ['eg', 'e.g', 'example', 'x'])):
-        return str(p.get('case_size_description', ''))
+        return safe_str(p.get('case_size_description'), '')
 
     if any(x in label for x in ['vat rate', 'vat', 'tax rate', 'gst rate',
                                   'hst', 'sales tax', 'tax / vat',
                                   'tax type']):
-        return str(p.get('vat_rate', ''))
+        return safe_str(p.get('vat_rate'), '')
 
     if any(x in label for x in ['minimum order', 'moq', 'min order',
                                   'minimum quantity']):
-        v = p.get('moq_units') or p.get('moq_value')
-        return str(v) if v else 'N/A'
+        return safe_str(p.get('moq_units') or p.get('moq_value'))
 
     if any(x in label for x in ['lead time', 'delivery time',
                                   'lead time (days)', 'lead time (weeks)',
                                   'turnaround time']):
-        return str(p.get('lead_time_days', '')) or 'N/A'
+        return safe_str(p.get('lead_time_days'))
 
     if any(x in label for x in ['payment terms', 'terms of payment',
                                   'credit terms', 'payment conditions']):
-        return str(p.get('payment_terms', '')) or 'N/A'
+        return safe_str(p.get('payment_terms'))
 
     if any(x in label for x in ['case gross weight', 'gross weight',
                                   'gross case weight', 'total case weight',
                                   'case weight (gross)', 'weight incl']):
-        return str(p.get('case_gross_weight_kg', '')) or 'N/A'
+        return safe_str(p.get('case_gross_weight_kg'))
 
     if any(x in label for x in ['case net weight', 'net weight',
                                   'net case weight', 'product weight only',
                                   'case weight (net)', 'weight excl']):
-        return str(p.get('case_net_weight_kg', '')) or 'N/A'
+        return safe_str(p.get('case_net_weight_kg'))
 
     if any(x in label for x in ['unit weight', 'individual unit weight',
                                   'net weight per unit', 'unit net weight',
                                   'product weight per unit']):
-        w = p.get('unit_net_weight_g')
-        return str(w) if w else 'N/A'
+        return safe_str(p.get('unit_net_weight_g'))
 
     if any(x in label for x in ['minimum shelf life', 'min shelf life',
                                   'shelf life on delivery', 'shelf life at receipt',
@@ -261,37 +280,36 @@ def map_field(label_raw, product):
 
     if any(x in label for x in ['storage conditions', 'storage criteria',
                                   'storage requirement', 'store']):
-        return str(p.get('storage_conditions', ''))
+        return safe_str(p.get('storage_conditions'), '')
 
     if any(x in label for x in ['storage instructions', 'storage advice',
                                   'how to store', 'storage guidance']):
-        return str(p.get('storage_instructions', '')) or 'N/A'
+        return safe_str(p.get('storage_instructions'))
 
     if any(x in label for x in ['cases per pallet', 'pallet configuration',
                                   'cases/pallet', 'units per pallet']):
-        return str(p.get('cases_per_pallet', '')) or 'N/A'
+        return safe_str(p.get('cases_per_pallet'))
 
     if 'cases per layer' in label or 'layers per pallet' in label:
-        v = p.get('cases_per_layer') or p.get('layers_per_pallet')
-        return str(v) if v else 'N/A'
+        return safe_str(p.get('cases_per_layer') or p.get('layers_per_pallet'))
 
     if any(x in label for x in ['country of provenance', 'provenance',
                                   'last country of duty', 'duty paid country']):
-        return str(p.get('country_of_provenance') or p.get('country_of_origin', ''))
+        return safe_str(p.get('country_of_provenance') or p.get('country_of_origin'), '')
 
     if any(x in label for x in ['country of origin', 'country of manufacture',
                                   'country of production', 'made in',
                                   'produced in', 'origin country',
                                   'place of manufacture']):
-        return str(p.get('country_of_origin', ''))
+        return safe_str(p.get('country_of_origin'), '')
 
     if any(x in label for x in ['hs code', 'hs / commodity', 'tariff code',
                                   'commodity code', 'customs code',
                                   'hts code', 'import code']) and 'sku' not in label:
-        return str(p.get('hs_commodity_code', '')) or 'N/A'
+        return safe_str(p.get('hs_commodity_code'))
 
     if 'meursing' in label:
-        return str(p.get('meursing_code', '')) or 'N/A'
+        return safe_str(p.get('meursing_code'))
 
     if any(x in label for x in ['eu address', 'european address']):
         return 'Yes' if p.get('eu_address_on_pack') else 'No'
@@ -314,7 +332,7 @@ def map_field(label_raw, product):
                                   'organic cert number', 'cert number',
                                   'certification number', 'accreditation number',
                                   'approval number', 'organic body']):
-        return str(p.get('organic_cert_number', '')) or 'N/A'
+        return safe_str(p.get('organic_cert_number'))
 
     if 'organic' in label and 'cert' not in label and 'number' not in label:
         return 'Yes' if p.get('is_organic') else 'No'
@@ -322,9 +340,12 @@ def map_field(label_raw, product):
     if any(x in label for x in ['fairtrade', 'fair trade', 'fair-trade']):
         return 'Yes' if p.get('is_fairtrade') else 'No'
 
-    if any(x in label for x in ['added sugar', 'contains sugar',
-                                  'no added sugar', 'free from sugar']):
-        return 'Yes' if p.get('contains_added_sugar') else 'No'
+    if any(x in label for x in ['added sugar', 'contains sugar']):
+        if not any(u in label for u in ['g per', 'mg per', 'grams', '(g)', 'g)', 'per 100', 'per serving']):
+            v = p.get('contains_added_sugar')
+            if v is None:
+                return 'N/A'
+            return 'Yes' if v else 'No'
 
     if any(x in label for x in ['gm free', 'non-gmo', 'gmo free',
                                   'non gmo', 'genetically modified free',
@@ -337,7 +358,7 @@ def map_field(label_raw, product):
 
     if any(x in label for x in ['hfss score', 'nutrient profile score',
                                   'npm score', 'hfss nutrient']):
-        return str(p.get('hfss_score', '')) or 'N/A'
+        return safe_str(p.get('hfss_score'))
 
     if any(x in label for x in ['less healthy', 'hfss less healthy',
                                   'is product less healthy']):
@@ -356,24 +377,24 @@ def map_field(label_raw, product):
     if any(x in label for x in ['abv', 'alcohol by volume',
                                   'alcohol %', 'alcohol content',
                                   'alcohol percentage']):
-        return str(p.get('abv_percentage', '')) or 'N/A'
+        return safe_str(p.get('abv_percentage'))
 
     if 'palm oil free' in label:
         status = str(p.get('palm_oil_status', '')).lower()
         return 'Yes' if 'not contain' in status or 'free' in status else 'No'
 
     if any(x in label for x in ['palm oil type', 'type of palm oil']):
-        return str(p.get('palm_oil_type', '')) or 'N/A'
+        return safe_str(p.get('palm_oil_type'))
 
     if any(x in label for x in ['palm oil percentage', '% palm oil']):
-        return str(p.get('palm_oil_percentage', '')) or 'N/A'
+        return safe_str(p.get('palm_oil_percentage'))
 
     if any(x in label for x in ['palm oil', 'rspo']):
-        return str(p.get('palm_oil_status', '')) or 'N/A'
+        return safe_str(p.get('palm_oil_status'))
 
     if any(x in label for x in ['egg status', 'egg sourcing',
                                   'free range egg', 'are they free range']):
-        return str(p.get('egg_status', '')) or 'N/A'
+        return safe_str(p.get('egg_status'))
 
     if any(x in label for x in ['dairy free', 'dairy-free',
                                   'free from dairy', 'lactose free']):
@@ -463,6 +484,12 @@ def map_field(label_raw, product):
                                   'total carbs', 'of which carbs']):
         return nutritional_value(p.get('carbohydrates'), label, serving)
 
+    if 'added sugar' in label and any(u in label for u in
+            ['g per', 'mg per', 'grams', '(g)', 'per 100', 'per serving']):
+        if p.get('contains_added_sugar'):
+            return nutritional_value(p.get('sugars', 0), label, serving)
+        return '0'
+
     if any(x in label for x in ['total sugar', 'of which sugar',
                                   'sugars', 'sugar content']):
         return nutritional_value(p.get('sugars'), label, serving)
@@ -486,8 +513,17 @@ def map_field(label_raw, product):
     if 'sodium' in label:
         salt = p.get('salt')
         if salt is not None:
-            sodium = round(float(salt) / 2.5, 3)
-            return str(sodium)
+            serving_size = p.get('serving_size_value')
+            sodium_per_100g_mg = float(salt) / 2.5 * 1000
+            if 'per serving' in label and serving_size:
+                v = round(sodium_per_100g_mg * float(serving_size) / 100, 1)
+            elif 'per 100' in label:
+                v = round(sodium_per_100g_mg, 1)
+            else:
+                v = round(sodium_per_100g_mg, 1)
+            if v == int(v):
+                v = int(v)
+            return str(v)
         return 'N/A'
 
     if any(x in label for x in ['salt equivalent', 'total salt',
@@ -499,11 +535,14 @@ def map_field(label_raw, product):
     if any(x in label for x in ['inner packaging material',
                                   'packaging material', 'packaging type',
                                   'primary packaging']):
-        return str(p.get('inner_packaging_material', '')) or 'N/A'
+        return safe_str(p.get('inner_packaging_material'))
 
     if any(x in label for x in ['is packaging recyclable', 'recyclable',
                                   'can it be recycled']):
-        return 'Yes' if p.get('is_recyclable') else 'No'
+        v = p.get('is_recyclable')
+        if v is None:
+            return 'N/A'
+        return 'Yes' if v else 'No'
 
     if any(x in label for x in ['biodegradable']):
         return 'Yes' if p.get('is_biodegradable') else 'No'
@@ -524,7 +563,7 @@ def map_field(label_raw, product):
 
     if any(x in label for x in ['fsc', 'pefc', 'paper certified',
                                   'card certified', 'certified paper']):
-        return str(p.get('paper_card_certified', '')) or 'Uncertified'
+        return safe_str(p.get('paper_card_certified'), 'Uncertified')
 
     return None
 
@@ -557,6 +596,44 @@ def detect_layout(ws):
     }
 
 
+def verify_fill(ws, products, value_col=3, label_col=2):
+    """Post-fill sanity checks. Returns list of issues fixed."""
+    issues_fixed = []
+
+    for row in ws.iter_rows():
+        for cell in row:
+            if isinstance(cell, MergedCell):
+                continue
+            if cell.column != value_col:
+                continue
+            if cell.value is None:
+                continue
+
+            val = str(cell.value).strip()
+            label_cell = ws.cell(row=cell.row, column=label_col)
+            label = str(label_cell.value or '').lower()
+
+            if val in ('None', 'null', 'nan'):
+                cell.value = 'N/A'
+                issues_fixed.append(f'Row {cell.row}: None → N/A')
+
+            numeric_indicators = ['per 100', 'per serving', 'kcal', 'kj', '(g)', '(kg)', '(mg)',
+                                  'weight', 'price', 'rrp', 'cost']
+            countries = ['united kingdom', 'ireland', 'united states', 'belgium',
+                         'netherlands', 'germany', 'france', 'bulgaria', 'australia']
+            if any(ind in label for ind in numeric_indicators):
+                if val.lower() in countries:
+                    cell.value = None
+                    issues_fixed.append(f'Row {cell.row}: country in numeric field removed')
+
+            if any(ind in label for ind in ['g per', 'mg per', 'kcal per', 'kj per']) and 'added' not in label:
+                if val in ('Yes', 'No'):
+                    cell.value = 'N/A'
+                    issues_fixed.append(f'Row {cell.row}: Yes/No in numeric field → N/A')
+
+    return issues_fixed
+
+
 def fill_single_sheet(ws, product, value_col=3, label_col=2):
     filled = 0
     for row in ws.iter_rows():
@@ -572,9 +649,12 @@ def fill_single_sheet(ws, product, value_col=3, label_col=2):
                 continue
             value = map_field(field_label, product)
             if value is not None:
+                if value in ('None', 'null', ''):
+                    value = 'N/A'
                 safe_write(ws, cell.row, value_col, value)
                 filled += 1
-    return filled
+    issues_fixed = verify_fill(ws, [product], value_col, label_col)
+    return filled, issues_fixed
 
 
 def add_product_column_headers(ws, layout, product_index, product_col):
@@ -647,6 +727,7 @@ async def fill_nlf(req: FillRequest):
         layout = detect_layout(ws)
 
         total_filled = 0
+        all_issues_fixed = []
 
         if layout['is_column_format']:
             label_col = layout['label_col']
@@ -658,26 +739,9 @@ async def fill_nlf(req: FillRequest):
                 add_product_column_headers(ws, layout, i, col)
                 if i > 0:
                     copy_data_cell_format(ws, layout, template_col, col, data_start_row)
-                total_filled += fill_single_sheet(ws, product, value_col=col, label_col=label_col)
-
-        elif req.fill_mode == 'tabs' or len(req.products) == 1:
-            template_sheet_name = product_sheet
-            template_idx = wb.sheetnames.index(template_sheet_name)
-            for i, product in enumerate(req.products):
-                if i == 0:
-                    target_ws = ws
-                else:
-                    target_ws = wb.copy_worksheet(wb[template_sheet_name])
-                    target_ws.title = f"Product {i + 1}"
-                    for dv in wb[template_sheet_name].data_validations.dataValidation:
-                        target_ws.add_data_validation(deepcopy(dv))
-                    current_idx = wb.sheetnames.index(target_ws.title)
-                    wb.move_sheet(target_ws.title, offset=(template_idx + i) - current_idx)
-                    for row in target_ws.iter_rows():
-                        for cell in row:
-                            if not isinstance(cell, MergedCell) and cell.column == 3:
-                                cell.value = None
-                total_filled += fill_single_sheet(target_ws, product)
+                filled, issues = fill_single_sheet(ws, product, value_col=col, label_col=label_col)
+                total_filled += filled
+                all_issues_fixed.extend(issues)
 
         elif req.fill_mode == 'rows':
             header_row_num = None
@@ -696,6 +760,8 @@ async def fill_nlf(req: FillRequest):
                     for col, field_label in headers.items():
                         value = map_field(field_label, product)
                         if value is not None:
+                            if value in ('None', 'null', ''):
+                                value = 'N/A'
                             safe_write(ws, row_num, col, value)
                             total_filled += 1
 
@@ -703,9 +769,52 @@ async def fill_nlf(req: FillRequest):
             label_col = layout['label_col']
             base_col = layout['value_col']
             for i, product in enumerate(req.products):
-                total_filled += fill_single_sheet(
+                filled, issues = fill_single_sheet(
                     ws, product, value_col=base_col + i, label_col=label_col,
                 )
+                total_filled += filled
+                all_issues_fixed.extend(issues)
+
+        elif req.fill_mode == 'tabs' or (not layout['is_column_format'] and len(req.products) >= 1):
+            template_sheet_name = product_sheet
+
+            for sheet_name in list(wb.sheetnames):
+                if sheet_name == template_sheet_name:
+                    continue
+                if re.match(r'^product\s*\d+$', sheet_name.strip(), re.IGNORECASE):
+                    del wb[sheet_name]
+
+            layout_t = detect_layout(wb[template_sheet_name])
+            val_col = layout_t.get('value_col', 3)
+            for row in wb[template_sheet_name].iter_rows(min_row=5):
+                for cell in row:
+                    if not isinstance(cell, MergedCell) and cell.column == val_col:
+                        cell.value = None
+
+            filled, issues = fill_single_sheet(wb[template_sheet_name], req.products[0])
+            total_filled += filled
+            all_issues_fixed.extend(issues)
+
+            if (re.match(r'^product\s*\d+$', template_sheet_name.strip(), re.IGNORECASE) and
+                    not re.match(r'^product\s*1$', template_sheet_name.strip(), re.IGNORECASE)):
+                wb[template_sheet_name].title = 'Product 1'
+                template_sheet_name = 'Product 1'
+
+            template_idx = wb.sheetnames.index(template_sheet_name)
+            for i, product in enumerate(req.products[1:], start=2):
+                new_ws = wb.copy_worksheet(wb[template_sheet_name])
+                new_ws.title = f'Product {i}'
+                for dv in wb[template_sheet_name].data_validations.dataValidation:
+                    new_ws.add_data_validation(deepcopy(dv))
+                current_idx = wb.sheetnames.index(new_ws.title)
+                wb.move_sheet(new_ws.title, offset=(template_idx + i - 1) - current_idx)
+                for row in new_ws.iter_rows(min_row=5):
+                    for cell in row:
+                        if not isinstance(cell, MergedCell) and cell.column == val_col:
+                            cell.value = None
+                filled, issues = fill_single_sheet(new_ws, product)
+                total_filled += filled
+                all_issues_fixed.extend(issues)
 
         output = io.BytesIO()
         wb.save(output)
@@ -724,6 +833,7 @@ async def fill_nlf(req: FillRequest):
             "fields_filled": total_filled,
             "products_filled": len(req.products),
             "fill_mode": req.fill_mode,
+            "verification_issues_fixed": len(all_issues_fixed),
         }
 
     except HTTPException:
