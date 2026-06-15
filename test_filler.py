@@ -281,15 +281,16 @@ print(f'{"PASS" if count_ok else "FAIL"} | Formula count before={before_count} a
 results.append(count_ok)
 
 # Dundeis-style: 5 products, horizontal_rows, example row, Instructions sheet untouched
+# Sheet name has trailing space — form_spec uses name without space (must still resolve)
 wb5 = openpyxl.Workbook()
 ws5 = wb5.active
-ws5.title = 'New Lines'
+ws5.title = 'Product details '
 headers5 = ['Product Name', 'Brand', 'RRP', 'EAN Barcode (Unit)', 'Vegan']
-for col, hdr in enumerate(headers5, start=1):
+for col, hdr in enumerate(headers5, start=2):
     ws5.cell(row=8, column=col).value = hdr
-ws5.cell(row=9, column=1).value = 'EXAMPLE - DO NOT EDIT'
-ws5.cell(row=9, column=2).value = 'Sample Brand'
-instr = wb5.create_sheet('Instructions')
+ws5.cell(row=9, column=2).value = '1. Example line'
+ws5.cell(row=9, column=3).value = 'Salted Peanuts'
+instr = wb5.create_sheet('Marketing content')
 instr['A1'] = 'Do not modify this sheet'
 instr['B2'] = '=1+1'
 file_bytes5 = io.BytesIO()
@@ -307,29 +308,69 @@ req5 = FillRequest(
     retailer_name='Retailer_NLF_5_products',
     fill_mode='auto',
     form_spec={
-        'data_sheet': 'New Lines',
+        'data_sheet': 'Product details',
         'layout': 'horizontal_rows',
         'header_row': 8,
         'first_data_row': 10,
         'example_rows': [9],
-        'other_sheets': ['Instructions'],
+        'other_sheets': ['Marketing content'],
         'field_map': [],
     },
 )
 res5 = asyncio.run(fill_nlf(req5))
 out5 = openpyxl.load_workbook(io.BytesIO(base64.b64decode(res5['file_base64'])))
-ws5_out = out5['New Lines']
+ws5_out = out5['Product details ']
 dundeis_ok = (
-    ws5_out.cell(row=9, column=1).value == 'EXAMPLE - DO NOT EDIT'
-    and ws5_out.cell(row=10, column=1).value == 'Product 1'
-    and ws5_out.cell(row=14, column=1).value == 'Product 5'
-    and ws5_out.cell(row=10, column=4).value == '5060000000001'
-    and ws5_out.cell(row=10, column=5).value == 'Yes'
-    and out5['Instructions']['A1'].value == 'Do not modify this sheet'
-    and str(out5['Instructions']['B2'].value).startswith('=')
+    res5['fields_filled'] > 0
+    and ws5_out.cell(row=9, column=2).value == '1. Example line'
+    and ws5_out.cell(row=9, column=3).value == 'Salted Peanuts'
+    and ws5_out.cell(row=10, column=2).value == 'Product 1'
+    and ws5_out.cell(row=14, column=2).value == 'Product 5'
+    and ws5_out.cell(row=10, column=5).value == '5060000000001'
+    and ws5_out.cell(row=10, column=6).value == 'Yes'
+    and out5['Marketing content']['A1'].value == 'Do not modify this sheet'
+    and str(out5['Marketing content']['B2'].value).startswith('=')
 )
-print(f'{"PASS" if dundeis_ok else "FAIL"} | Dundeis 5-product horizontal_rows + example + Instructions sheet')
+print(f'{"PASS" if dundeis_ok else "FAIL"} | Dundeis 5-product horizontal_rows + trailing-space sheet + example preserved')
 results.append(dundeis_ok)
+
+# Trailing-space sheet name resolves via resolve_sheet_name
+from main import resolve_sheet_name
+trail_wb = openpyxl.Workbook()
+trail_wb.active.title = 'Product details '
+trail_ok = resolve_sheet_name(trail_wb, 'Product details') == 'Product details '
+print(f'{"PASS" if trail_ok else "FAIL"} | Trailing-space sheet name resolves correctly')
+results.append(trail_ok)
+
+# Zero-fill must raise 422, never return blank file
+from fastapi import HTTPException
+wb_zero = openpyxl.Workbook()
+wb_zero.active.title = 'Sheet1'
+zero_buf = io.BytesIO()
+wb_zero.save(zero_buf)
+b64_zero = base64.b64encode(zero_buf.getvalue()).decode()
+req_zero = FillRequest(
+    file_base64=b64_zero,
+    products=[{'product_name': 'X', 'brand_name': 'Y', 'allergen_details': [], 'certifications': []}],
+    retailer_name='Test',
+    fill_mode='auto',
+    form_spec={
+        'data_sheet': 'Sheet1',
+        'layout': 'vertical',
+        'label_column': 99,
+        'value_column': 100,
+        'other_sheets': [],
+        'example_rows': [],
+        'field_map': [],
+    },
+)
+zero_fill_ok = False
+try:
+    asyncio.run(fill_nlf(req_zero))
+except HTTPException as exc:
+    zero_fill_ok = exc.status_code == 422 and 'No fields were filled' in str(exc.detail)
+print(f'{"PASS" if zero_fill_ok else "FAIL"} | Zero-fill raises 422 with diagnostic detail')
+results.append(zero_fill_ok)
 
 print()
 print('--- Missing API key / Claude mock tests ---')

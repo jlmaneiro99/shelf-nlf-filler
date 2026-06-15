@@ -768,6 +768,155 @@ def detect_layout(ws):
     }
 
 
+def resolve_sheet_name(wb, sheet_name):
+    if not sheet_name:
+        return None
+    if sheet_name in wb.sheetnames:
+        return sheet_name
+    target = str(sheet_name).strip().lower()
+    for name in wb.sheetnames:
+        if name.strip().lower() == target:
+            return name
+    return None
+
+
+def find_data_sheet(wb):
+    for name in wb.sheetnames:
+        nl = name.lower().strip()
+        if any(k in nl for k in (
+            'product', 'new line', 'nlf', 'submission', 'details', 'form',
+        )):
+            return name
+    best_name = wb.sheetnames[0]
+    best_count = 0
+    for name in wb.sheetnames:
+        det = detect_header_and_layout(wb[name])
+        count = det.get('label_count', 0)
+        if count > best_count:
+            best_count = count
+            best_name = name
+    return best_name
+
+
+def detect_header_and_layout(ws):
+    best_row = None
+    best_count = 0
+    for r in range(1, 21):
+        count = 0
+        for cell in ws[r]:
+            if isinstance(cell, MergedCell):
+                continue
+            v = cell.value
+            if isinstance(v, str) and len(v.strip()) > 2 and not v.strip().startswith('='):
+                count += 1
+        if count > best_count:
+            best_count = count
+            best_row = r
+
+    if best_row and best_count >= 5:
+        first_data = best_row + 1
+        row_text = ' '.join(
+            str(c.value).lower() for c in ws[first_data]
+            if c.value and not isinstance(c, MergedCell)
+        )
+        if 'example' in row_text or 'sample' in row_text:
+            first_data = best_row + 2
+        return {
+            'layout': 'horizontal_rows',
+            'header_row': best_row,
+            'first_data_row': first_data,
+            'label_count': best_count,
+        }
+    return {
+        'layout': 'vertical',
+        'header_row': None,
+        'first_data_row': None,
+        'label_count': 0,
+    }
+
+
+def count_header_labels(ws, header_row):
+    count = 0
+    for cell in ws[header_row]:
+        if isinstance(cell, MergedCell):
+            continue
+        if cell.value and not str(cell.value).strip().startswith('='):
+            label = str(cell.value).strip()
+            if len(label) > 1:
+                count += 1
+    return count
+
+
+def resolve_fill_plan(wb, form_spec, fill_mode):
+    spec = form_spec or {}
+    sheet_used = resolve_sheet_name(wb, spec.get('data_sheet'))
+    layout_used = spec.get('layout')
+    header_row_used = spec.get('header_row')
+    first_data_row_used = spec.get('first_data_row')
+    example_rows = list(spec.get('example_rows') or [])
+    other_sheets = set(spec.get('other_sheets') or [])
+
+    if not sheet_used:
+        sheet_used = find_data_sheet(wb)
+
+    ws = wb[sheet_used]
+    detected = detect_header_and_layout(ws)
+    column_layout = detect_layout(ws)
+
+    if fill_mode == 'rows' and not header_row_used:
+        best_row, best_count = None, 0
+        for r in range(1, 21):
+            count = count_header_labels(ws, r)
+            if count > best_count:
+                best_count, best_row = count, r
+        if best_row and best_count >= 3:
+            layout_used = 'horizontal_rows'
+            header_row_used = best_row
+            first_data = best_row + 1
+            row_text = ' '.join(
+                str(c.value).lower() for c in ws[first_data]
+                if c.value and not isinstance(c, MergedCell)
+            )
+            if 'example' in row_text or 'sample' in row_text:
+                first_data = best_row + 2
+            first_data_row_used = first_data
+
+    if column_layout['is_column_format'] and layout_used != 'horizontal_rows':
+        layout_used = 'horizontal_columns'
+    elif detected['layout'] == 'horizontal_rows' and detected.get('label_count', 0) >= 5:
+        if not layout_used or layout_used == 'vertical':
+            layout_used = 'horizontal_rows'
+        if not header_row_used:
+            header_row_used = detected['header_row']
+        if not first_data_row_used:
+            first_data_row_used = detected['first_data_row']
+    elif not layout_used:
+        layout_used = detected['layout'] or 'vertical'
+
+    if not header_row_used and detected.get('header_row'):
+        header_row_used = detected['header_row']
+    if not first_data_row_used and detected.get('first_data_row'):
+        first_data_row_used = detected['first_data_row']
+
+    labels_found_count = 0
+    if layout_used == 'horizontal_rows' and header_row_used:
+        labels_found_count = count_header_labels(ws, header_row_used)
+
+    return {
+        'sheet_used': sheet_used,
+        'layout_used': layout_used,
+        'header_row_used': header_row_used,
+        'first_data_row_used': first_data_row_used,
+        'example_rows': example_rows,
+        'other_sheets': other_sheets,
+        'labels_found_count': labels_found_count,
+        'column_layout': column_layout,
+        'label_col': spec.get('label_column') or column_layout['label_col'],
+        'value_col': spec.get('value_column') or column_layout['value_col'],
+        'first_data_column': spec.get('first_data_column'),
+    }
+
+
 def verify_fill(ws, products, value_col=3, label_col=2):
     """Post-fill sanity checks. Returns list of issues fixed."""
     issues_fixed = []
@@ -847,34 +996,193 @@ def fill_single_sheet(ws, product, value_col=3, label_col=2, example_rows=None):
     return filled, issues_fixed
 
 
-def fill_horizontal_rows(ws, products, form_spec):
-    header_row = form_spec.get('header_row')
-    first_data_row = form_spec.get('first_data_row')
+def fill_horizontal_rows(ws, products, plan):
+    header_row = plan.get('header_row_used')
+    first_data_row = plan.get('first_data_row_used')
     if not header_row or not first_data_row:
-        return 0, []
+        return 0, [], plan.get('labels_found_count', 0)
 
-    example_rows = set(form_spec.get('example_rows') or [])
+    example_rows = set(plan.get('example_rows') or [])
     headers = {}
     for cell in ws[header_row]:
-        if cell.value and not isinstance(cell, MergedCell):
+        if isinstance(cell, MergedCell):
+            continue
+        if cell.value and not str(cell.value).strip().startswith('='):
             label = str(cell.value).strip()
             if label:
                 headers[cell.column] = label
 
+    labels_found_count = len(headers)
     total_filled = 0
     all_issues = []
+
     for i, product in enumerate(products):
-        row_num = first_data_row + i
-        if row_num in example_rows:
+        target_row = first_data_row + i
+        if target_row in example_rows:
             continue
-        labels = list(headers.values())
-        resolved = resolve_values_for_labels(labels, product)
+        unresolved = []
         for col, label in headers.items():
-            value = resolved.get(label)
+            existing = ws.cell(row=target_row, column=col)
+            if is_formula_cell(existing):
+                continue
+            value = map_field(label, product)
             if value is not None:
-                if safe_write(ws, row_num, col, value):
+                if value in ('None', 'null', ''):
+                    value = 'N/A'
+                if safe_write(ws, target_row, col, value):
                     total_filled += 1
-    return total_filled, all_issues
+            else:
+                unresolved.append((col, label))
+        if unresolved:
+            resolved = claude_resolve_fields([l for _, l in unresolved], product)
+            for col, label in unresolved:
+                if label in resolved and resolved[label]:
+                    existing = ws.cell(row=target_row, column=col)
+                    if not is_formula_cell(existing):
+                        val = resolved[label]
+                        if val in ('None', 'null', ''):
+                            val = 'N/A'
+                        if safe_write(ws, target_row, col, val):
+                            total_filled += 1
+
+    return total_filled, all_issues, labels_found_count
+
+
+def execute_fill(wb, products, plan, fill_mode):
+    ws = wb[plan['sheet_used']]
+    layout = plan['layout_used']
+    total_filled = 0
+    all_issues = []
+    labels_found_count = plan.get('labels_found_count', 0)
+
+    if layout == 'horizontal_rows':
+        total_filled, all_issues, labels_found_count = fill_horizontal_rows(ws, products, plan)
+        return total_filled, all_issues, labels_found_count
+
+    if layout == 'horizontal_columns':
+        spec = {
+            'label_column': plan['label_col'],
+            'first_data_column': plan.get('first_data_column') or plan['value_col'],
+            'value_column': plan['value_col'],
+            'example_rows': plan.get('example_rows'),
+        }
+        total_filled, all_issues = fill_horizontal_columns(ws, products, spec, plan['label_col'])
+        return total_filled, all_issues, labels_found_count
+
+    column_layout = plan['column_layout']
+    if column_layout.get('is_column_format'):
+        label_col = column_layout['label_col']
+        template_col = column_layout['product_col_start']
+        data_start_row = (column_layout['header_row'] or 1) + 2
+        for i, product in enumerate(products):
+            col = template_col + i
+            add_product_column_headers(ws, column_layout, i, col)
+            if i > 0:
+                copy_data_cell_format(ws, column_layout, template_col, col, data_start_row)
+            filled, issues = fill_single_sheet(ws, product, value_col=col, label_col=label_col)
+            total_filled += filled
+            all_issues.extend(issues)
+        return total_filled, all_issues, labels_found_count
+
+    if fill_mode == 'rows' and plan.get('header_row_used'):
+        headers = {}
+        for cell in ws[plan['header_row_used']]:
+            if cell.value and not isinstance(cell, MergedCell):
+                label = str(cell.value).strip()
+                if label and not label.startswith('='):
+                    headers[cell.column] = label
+        labels_found_count = len(headers)
+        first_row = plan.get('first_data_row_used') or (plan['header_row_used'] + 1)
+        for i, product in enumerate(products):
+            row_num = first_row + i
+            total_filled += _fill_product_row(ws, row_num, headers, product)
+        return total_filled, all_issues, labels_found_count
+
+    use_tabs = fill_mode == 'tabs' or (fill_mode == 'auto' and len(products) > 1)
+    val_col = plan['value_col']
+    label_col = plan['label_col']
+    example_rows = plan.get('example_rows') or []
+    template_sheet_name = plan['sheet_used']
+    other_sheets = plan.get('other_sheets') or set()
+
+    if use_tabs and len(products) > 1:
+        for sheet_name in list(wb.sheetnames):
+            if sheet_name == template_sheet_name or sheet_name in other_sheets:
+                continue
+            if re.match(r'^product\s*\d+$', sheet_name.strip(), re.IGNORECASE):
+                del wb[sheet_name]
+        for row in wb[template_sheet_name].iter_rows(min_row=5):
+            for cell in row:
+                if not isinstance(cell, MergedCell) and cell.column == val_col:
+                    cell.value = None
+        filled, issues = fill_single_sheet(
+            wb[template_sheet_name], products[0], val_col, label_col, example_rows,
+        )
+        total_filled += filled
+        all_issues.extend(issues)
+        if (re.match(r'^product\s*\d+$', template_sheet_name.strip(), re.IGNORECASE) and
+                not re.match(r'^product\s*1$', template_sheet_name.strip(), re.IGNORECASE)):
+            wb[template_sheet_name].title = 'Product 1'
+            template_sheet_name = 'Product 1'
+        template_idx = wb.sheetnames.index(template_sheet_name)
+        for i, product in enumerate(products[1:], start=2):
+            new_ws = wb.copy_worksheet(wb[template_sheet_name])
+            new_ws.title = f'Product {i}'
+            for dv in wb[template_sheet_name].data_validations.dataValidation:
+                new_ws.add_data_validation(deepcopy(dv))
+            current_idx = wb.sheetnames.index(new_ws.title)
+            wb.move_sheet(new_ws.title, offset=(template_idx + i - 1) - current_idx)
+            for row in new_ws.iter_rows(min_row=5):
+                for cell in row:
+                    if not isinstance(cell, MergedCell) and cell.column == val_col:
+                        cell.value = None
+            filled, issues = fill_single_sheet(new_ws, product, val_col, label_col, example_rows)
+            total_filled += filled
+            all_issues.extend(issues)
+        return total_filled, all_issues, labels_found_count
+
+    if fill_mode == 'columns':
+        for i, product in enumerate(products):
+            filled, issues = fill_single_sheet(
+                ws, product, value_col=val_col + i, label_col=label_col,
+            )
+            total_filled += filled
+            all_issues.extend(issues)
+        return total_filled, all_issues, labels_found_count
+
+    filled, issues = fill_single_sheet(ws, products[0], val_col, label_col, example_rows)
+    total_filled += filled
+    all_issues.extend(issues)
+    return total_filled, all_issues, labels_found_count
+
+
+def _fill_product_row(ws, row_num, headers, product):
+    filled = 0
+    unresolved = []
+    for col, label in headers.items():
+        existing = ws.cell(row=row_num, column=col)
+        if is_formula_cell(existing):
+            continue
+        value = map_field(label, product)
+        if value is not None:
+            if value in ('None', 'null', ''):
+                value = 'N/A'
+            if safe_write(ws, row_num, col, value):
+                filled += 1
+        else:
+            unresolved.append((col, label))
+    if unresolved:
+        resolved = claude_resolve_fields([l for _, l in unresolved], product)
+        for col, label in unresolved:
+            if label in resolved and resolved[label]:
+                existing = ws.cell(row=row_num, column=col)
+                if not is_formula_cell(existing):
+                    val = resolved[label]
+                    if val in ('None', 'null', ''):
+                        val = 'N/A'
+                    if safe_write(ws, row_num, col, val):
+                        filled += 1
+    return filled
 
 
 def fill_horizontal_columns(ws, products, form_spec, label_col=None):
@@ -893,75 +1201,9 @@ def fill_horizontal_columns(ws, products, form_spec, label_col=None):
 
 
 def fill_using_form_spec(wb, products, form_spec, fill_mode='auto'):
-    layout = form_spec.get('layout') or 'vertical'
-    data_sheet = form_spec.get('data_sheet')
-    other_sheets = set(form_spec.get('other_sheets') or [])
-
-    if not data_sheet or data_sheet not in wb.sheetnames:
-        data_sheet = None
-        for name in wb.sheetnames:
-            if name not in other_sheets:
-                data_sheet = name
-                break
-        data_sheet = data_sheet or wb.sheetnames[0]
-
-    ws = wb[data_sheet]
-    example_rows = form_spec.get('example_rows') or []
-    label_col = form_spec.get('label_column') or 2
-    value_col = form_spec.get('value_column') or 3
-
-    if layout == 'horizontal_rows':
-        return fill_horizontal_rows(ws, products, form_spec)
-
-    if layout == 'horizontal_columns':
-        return fill_horizontal_columns(ws, products, form_spec, label_col)
-
-    use_tabs = fill_mode == 'tabs' or (fill_mode == 'auto' and len(products) > 1)
-    if use_tabs and len(products) > 1:
-        template_sheet_name = data_sheet
-        for sheet_name in list(wb.sheetnames):
-            if sheet_name == template_sheet_name or sheet_name in other_sheets:
-                continue
-            if re.match(r'^product\s*\d+$', sheet_name.strip(), re.IGNORECASE):
-                del wb[sheet_name]
-
-        for row in wb[template_sheet_name].iter_rows(min_row=5):
-            for cell in row:
-                if not isinstance(cell, MergedCell) and cell.column == value_col:
-                    cell.value = None
-
-        total_filled = 0
-        all_issues = []
-        filled, issues = fill_single_sheet(
-            wb[template_sheet_name], products[0], value_col, label_col, example_rows,
-        )
-        total_filled += filled
-        all_issues.extend(issues)
-
-        if (re.match(r'^product\s*\d+$', template_sheet_name.strip(), re.IGNORECASE) and
-                not re.match(r'^product\s*1$', template_sheet_name.strip(), re.IGNORECASE)):
-            wb[template_sheet_name].title = 'Product 1'
-            template_sheet_name = 'Product 1'
-
-        template_idx = wb.sheetnames.index(template_sheet_name)
-        for i, product in enumerate(products[1:], start=2):
-            new_ws = wb.copy_worksheet(wb[template_sheet_name])
-            new_ws.title = f'Product {i}'
-            for dv in wb[template_sheet_name].data_validations.dataValidation:
-                new_ws.add_data_validation(deepcopy(dv))
-            current_idx = wb.sheetnames.index(new_ws.title)
-            wb.move_sheet(new_ws.title, offset=(template_idx + i - 1) - current_idx)
-            for row in new_ws.iter_rows(min_row=5):
-                for cell in row:
-                    if not isinstance(cell, MergedCell) and cell.column == value_col:
-                        cell.value = None
-            filled, issues = fill_single_sheet(new_ws, product, value_col, label_col, example_rows)
-            total_filled += filled
-            all_issues.extend(issues)
-        return total_filled, all_issues
-
-    filled, issues = fill_single_sheet(ws, products[0], value_col, label_col, example_rows)
-    return filled, issues
+    plan = resolve_fill_plan(wb, form_spec, fill_mode)
+    total_filled, all_issues, _ = execute_fill(wb, products, plan, fill_mode)
+    return total_filled, all_issues
 
 
 def add_product_column_headers(ws, layout, product_index, product_col):
@@ -1015,122 +1257,10 @@ async def fill_nlf(req: FillRequest):
         total_filled = 0
         all_issues_fixed = []
 
-        if req.form_spec:
-            total_filled, all_issues_fixed = fill_using_form_spec(
-                wb, req.products, req.form_spec, req.fill_mode,
-            )
-        else:
-            product_sheet = None
-            for name in wb.sheetnames:
-                nl = name.lower()
-                if (nl.startswith('product') or nl.startswith('sku') or
-                        nl == 'template' or nl == 'new line' or
-                        nl == 'new line form' or nl == 'nlf' or nl == 'form' or
-                        'line form' in nl or 'new line' in nl or 'submission' in nl):
-                    product_sheet = name
-                    break
-
-            if not product_sheet:
-                best, best_count = None, 0
-                for name in wb.sheetnames:
-                    count = sum(1 for row in wb[name].iter_rows()
-                                for cell in row
-                                if cell.value and not isinstance(cell, MergedCell))
-                    if count > best_count:
-                        best_count, best = count, name
-                product_sheet = best or wb.sheetnames[0]
-
-            ws = wb[product_sheet]
-            layout = detect_layout(ws)
-
-            if layout['is_column_format']:
-                label_col = layout['label_col']
-                template_col = layout['product_col_start']
-                data_start_row = (layout['header_row'] or 1) + 2
-
-                for i, product in enumerate(req.products):
-                    col = template_col + i
-                    add_product_column_headers(ws, layout, i, col)
-                    if i > 0:
-                        copy_data_cell_format(ws, layout, template_col, col, data_start_row)
-                    filled, issues = fill_single_sheet(ws, product, value_col=col, label_col=label_col)
-                    total_filled += filled
-                    all_issues_fixed.extend(issues)
-
-            elif req.fill_mode == 'rows':
-                header_row_num = None
-                for row in ws.iter_rows(min_row=1, max_row=5):
-                    non_empty = [c for c in row if c.value and not isinstance(c, MergedCell)]
-                    if len(non_empty) > 3:
-                        header_row_num = row[0].row
-                        break
-                if header_row_num:
-                    headers = {}
-                    for cell in ws[header_row_num]:
-                        if cell.value and not isinstance(cell, MergedCell):
-                            headers[cell.column] = str(cell.value).strip()
-                    for i, product in enumerate(req.products):
-                        row_num = header_row_num + 1 + i
-                        labels = [l for l in headers.values() if l]
-                        resolved = resolve_values_for_labels(labels, product)
-                        for col, field_label in headers.items():
-                            if not field_label:
-                                continue
-                            value = resolved.get(field_label)
-                            if value is not None:
-                                if safe_write(ws, row_num, col, value):
-                                    total_filled += 1
-
-            elif req.fill_mode == 'columns':
-                label_col = layout['label_col']
-                base_col = layout['value_col']
-                for i, product in enumerate(req.products):
-                    filled, issues = fill_single_sheet(
-                        ws, product, value_col=base_col + i, label_col=label_col,
-                    )
-                    total_filled += filled
-                    all_issues_fixed.extend(issues)
-
-            elif req.fill_mode in ('tabs', 'auto') or len(req.products) >= 1:
-                template_sheet_name = product_sheet
-
-                for sheet_name in list(wb.sheetnames):
-                    if sheet_name == template_sheet_name:
-                        continue
-                    if re.match(r'^product\s*\d+$', sheet_name.strip(), re.IGNORECASE):
-                        del wb[sheet_name]
-
-                layout_t = detect_layout(wb[template_sheet_name])
-                val_col = layout_t.get('value_col', 3)
-                for row in wb[template_sheet_name].iter_rows(min_row=5):
-                    for cell in row:
-                        if not isinstance(cell, MergedCell) and cell.column == val_col:
-                            cell.value = None
-
-                filled, issues = fill_single_sheet(wb[template_sheet_name], req.products[0])
-                total_filled += filled
-                all_issues_fixed.extend(issues)
-
-                if (re.match(r'^product\s*\d+$', template_sheet_name.strip(), re.IGNORECASE) and
-                        not re.match(r'^product\s*1$', template_sheet_name.strip(), re.IGNORECASE)):
-                    wb[template_sheet_name].title = 'Product 1'
-                    template_sheet_name = 'Product 1'
-
-                template_idx = wb.sheetnames.index(template_sheet_name)
-                for i, product in enumerate(req.products[1:], start=2):
-                    new_ws = wb.copy_worksheet(wb[template_sheet_name])
-                    new_ws.title = f'Product {i}'
-                    for dv in wb[template_sheet_name].data_validations.dataValidation:
-                        new_ws.add_data_validation(deepcopy(dv))
-                    current_idx = wb.sheetnames.index(new_ws.title)
-                    wb.move_sheet(new_ws.title, offset=(template_idx + i - 1) - current_idx)
-                    for row in new_ws.iter_rows(min_row=5):
-                        for cell in row:
-                            if not isinstance(cell, MergedCell) and cell.column == val_col:
-                                cell.value = None
-                    filled, issues = fill_single_sheet(new_ws, product)
-                    total_filled += filled
-                    all_issues_fixed.extend(issues)
+        plan = resolve_fill_plan(wb, req.form_spec, req.fill_mode)
+        total_filled, all_issues_fixed, labels_found_count = execute_fill(
+            wb, req.products, plan, req.fill_mode,
+        )
 
         formula_count_after = count_formula_cells(wb)
         if _FillGuard.formula_blocks > 0:
@@ -1148,6 +1278,20 @@ async def fill_nlf(req: FillRequest):
                     f'Formula protection violation: formula cell count decreased '
                     f'from {formula_count_before} to {formula_count_after}. '
                     f'File not returned to prevent damage.'
+                ),
+            )
+
+        if total_filled == 0:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"No fields were filled. Layout detected: {plan.get('layout_used')}. "
+                    f"Data sheet: {plan.get('sheet_used')}. "
+                    f"Header row: {plan.get('header_row_used')}. "
+                    f"First data row: {plan.get('first_data_row_used')}. "
+                    f"Labels found: {labels_found_count}. "
+                    f"Products received: {len(req.products)}. "
+                    f"This indicates a layout detection or field matching failure."
                 ),
             )
 
