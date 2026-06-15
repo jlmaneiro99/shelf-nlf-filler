@@ -1121,6 +1121,11 @@ def verify_fill(ws, products, value_col=3, label_col=2):
 
 
 def fill_single_sheet(ws, product, value_col=3, label_col=2, example_rows=None):
+    print(
+        f"[FILL_FN] fill_single_sheet (VERTICAL) ENTER sheet={ws.title!r} "
+        f"value_col={value_col} label_col={label_col}",
+        flush=True,
+    )
     example_rows = set(example_rows or [])
     fields = []
     for row in ws.iter_rows():
@@ -1173,6 +1178,7 @@ def build_precomputed_by_label(precomputed):
 
 
 def fill_horizontal_rows(ws, products, plan, precomputed=None):
+    print(f"[FILL_FN] fill_horizontal_rows ENTER sheet={ws.title!r}", flush=True)
     header_row = plan.get('header_row_used')
     first_data_row = plan.get('first_data_row_used')
     if not header_row or not first_data_row:
@@ -1238,20 +1244,47 @@ def fill_horizontal_rows(ws, products, plan, precomputed=None):
 
 def execute_fill(wb, products, plan, fill_mode, precomputed=None):
     ws = wb[plan['sheet_used']]
-    layout = plan['layout_used']
+    column_layout = plan.get('column_layout') or {}
     total_filled = 0
     all_issues = []
     labels_found_count = plan.get('labels_found_count', 0)
 
+    # ── Resolve the layout ONCE. Never silently fall through to a vertical
+    # column dump: if the layout is unknown but a horizontal header row was
+    # detected, treat it as horizontal_rows. The vertical writer (fill_single_sheet
+    # down a value column) runs ONLY when resolved_layout == 'vertical'.
+    layout = plan.get('layout_used')
+    if not layout:
+        if plan.get('header_row_used'):
+            layout = 'horizontal_rows'
+        elif column_layout.get('is_column_format'):
+            layout = 'column_per_product'
+        else:
+            layout = 'vertical'
+    elif layout == 'vertical' and plan.get('header_row_used') and labels_found_count >= 5:
+        # A real horizontal header row was found — never vertical-dump over it.
+        layout = 'horizontal_rows'
+    plan['layout_used'] = layout
+
+    print(
+        f"[FILL] resolved_layout={layout!r} sheet={plan['sheet_used']!r} "
+        f"header_row={plan.get('header_row_used')} "
+        f"first_data_row={plan.get('first_data_row_used')} "
+        f"labels={labels_found_count} products={len(products)} fill_mode={fill_mode!r}",
+        flush=True,
+    )
+
     if layout == 'horizontal_rows':
         # Single authoritative pass — precomputed Step 3 values applied INSIDE,
         # with coordinates rebuilt for the horizontal layout (no vertical dump).
+        print("[FILL] -> fill_horizontal_rows ONLY (no other write path runs)", flush=True)
         total_filled, all_issues, labels_found_count = fill_horizontal_rows(
             ws, products, plan, precomputed,
         )
         return total_filled, all_issues, labels_found_count
 
     if layout == 'horizontal_columns':
+        print("[FILL] -> fill_horizontal_columns ONLY", flush=True)
         spec = {
             'label_column': plan['label_col'],
             'first_data_column': plan.get('first_data_column') or plan['value_col'],
@@ -1261,8 +1294,8 @@ def execute_fill(wb, products, plan, fill_mode, precomputed=None):
         total_filled, all_issues = fill_horizontal_columns(ws, products, spec, plan['label_col'])
         return total_filled, all_issues, labels_found_count
 
-    column_layout = plan['column_layout']
-    if column_layout.get('is_column_format'):
+    if layout == 'column_per_product' or column_layout.get('is_column_format'):
+        print("[FILL] -> column_per_product fill (PRODUCT N columns)", flush=True)
         label_col = column_layout['label_col']
         template_col = column_layout['product_col_start']
         data_start_row = (column_layout['header_row'] or 1) + 2
@@ -1276,18 +1309,17 @@ def execute_fill(wb, products, plan, fill_mode, precomputed=None):
             all_issues.extend(issues)
         return total_filled, all_issues, labels_found_count
 
-    if fill_mode == 'rows' and plan.get('header_row_used'):
-        headers = {}
-        for cell in ws[plan['header_row_used']]:
-            if cell.value and not isinstance(cell, MergedCell):
-                label = str(cell.value).strip()
-                if label and not label.startswith('='):
-                    headers[cell.column] = label
-        labels_found_count = len(headers)
-        first_row = plan.get('first_data_row_used') or (plan['header_row_used'] + 1)
-        for i, product in enumerate(products):
-            row_num = first_row + i
-            total_filled += _fill_product_row(ws, row_num, headers, product)
+    # ─────────────────────────────────────────────────────────────────────
+    # VERTICAL ONLY beyond this point. This is the ONLY code that writes
+    # down a single value column (the legacy Suma-style fill). It must never
+    # run for a horizontal form.
+    # ─────────────────────────────────────────────────────────────────────
+    if layout != 'vertical':
+        print(
+            f"[FILL] WARNING: unexpected layout {layout!r} — refusing to run vertical "
+            f"fill; treating as no-op to avoid column dump.",
+            flush=True,
+        )
         return total_filled, all_issues, labels_found_count
 
     use_tabs = fill_mode == 'tabs' or (fill_mode == 'auto' and len(products) > 1)
@@ -1296,6 +1328,11 @@ def execute_fill(wb, products, plan, fill_mode, precomputed=None):
     example_rows = plan.get('example_rows') or []
     template_sheet_name = plan['sheet_used']
     other_sheets = plan.get('other_sheets') or set()
+    print(
+        f"[FILL] -> VERTICAL fill (use_tabs={use_tabs}, value_col={val_col}, "
+        f"label_col={label_col})",
+        flush=True,
+    )
 
     if use_tabs and len(products) > 1:
         for sheet_name in list(wb.sheetnames):
@@ -1378,6 +1415,7 @@ def _fill_product_row(ws, row_num, headers, product):
 
 
 def fill_horizontal_columns(ws, products, form_spec, label_col=None):
+    print(f"[FILL_FN] fill_horizontal_columns ENTER sheet={ws.title!r}", flush=True)
     label_col = label_col or form_spec.get('label_column') or 2
     base_col = form_spec.get('first_data_column') or form_spec.get('value_column') or 3
     total_filled = 0

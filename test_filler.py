@@ -578,6 +578,48 @@ except Exception:
 print(f'{"PASS" if conflict_caught else "FAIL"} | Conflicting double-layout write triggers conflict (422)')
 results.append(conflict_caught)
 
+# Vertical writer must NOT run on a horizontal form — even with bait labels in
+# column B at rows 15/75 and NO form_spec (detection-only). C15/C75 stay empty.
+wb_bait = openpyxl.Workbook()
+ws_bait = wb_bait.active
+ws_bait.title = 'Product details '
+_bait_headers = {
+    2: 'Product Name', 3: 'Brand', 4: 'RRP', 5: 'Storage Conditions',
+    6: 'Country of Origin', 7: 'Energy kcal per 100g', 8: 'Protein g per 100g',
+}
+for _c, _t in _bait_headers.items():
+    ws_bait.cell(row=8, column=_c).value = _t
+ws_bait.cell(row=9, column=2).value = '1. Example line'
+# Bait: legacy Suma vertical label positions in column B
+ws_bait.cell(row=15, column=2).value = 'Storage Conditions'
+ws_bait.cell(row=75, column=2).value = 'Energy kcal per 100g'
+_bait_buf = io.BytesIO()
+wb_bait.save(_bait_buf)
+bait_products = [
+    {'product_name': f'Granola {i}', 'brand_name': 'Mi-Eco', 'rrp': 4.99 + i,
+     'storage_conditions': 'Ambient', 'country_of_origin': 'Bulgaria',
+     'energy_kcal': 422, 'protein': 17, 'allergen_details': [], 'certifications': []}
+    for i in range(5)
+]
+# NO form_spec — force Railway's own layout detection
+req_bait = FillRequest(
+    file_base64=base64.b64encode(_bait_buf.getvalue()).decode(),
+    products=bait_products,
+    retailer_name='Dundeis',
+    fill_mode='auto',
+    form_spec=None,
+)
+res_bait = asyncio.run(fill_nlf(req_bait))
+out_bait = openpyxl.load_workbook(io.BytesIO(base64.b64decode(res_bait['file_base64'])))
+ws_bait_out = out_bait['Product details ']
+c15 = ws_bait_out.cell(row=15, column=3).value
+c75 = ws_bait_out.cell(row=75, column=3).value
+horizontal_filled = ws_bait_out.cell(row=10, column=2).value == 'Granola 0'
+no_vertical = c15 in (None, '') and c75 in (None, '')
+print(f'{"PASS" if no_vertical and horizontal_filled else "FAIL"} '
+      f'| Horizontal form (no form_spec): C15={c15!r} C75={c75!r} empty, rows filled')
+results.append(no_vertical and horizontal_filled)
+
 print()
 print('--- Missing API key / Claude mock tests ---')
 
