@@ -372,6 +372,47 @@ except HTTPException as exc:
 print(f'{"PASS" if zero_fill_ok else "FAIL"} | Zero-fill raises 422 with diagnostic detail')
 results.append(zero_fill_ok)
 
+# Precomputed mappings write Step 3 values even when map_field would fail
+wb_pre = openpyxl.Workbook()
+ws_pre = wb_pre.active
+ws_pre.title = 'Product details '
+for col, hdr in enumerate(['Product Name', 'Brand', 'RRP'], start=2):
+    ws_pre.cell(row=8, column=col).value = hdr
+ws_pre.cell(row=9, column=2).value = 'Example line'
+pre_buf = io.BytesIO()
+wb_pre.save(pre_buf)
+b64_pre = base64.b64encode(pre_buf.getvalue()).decode()
+req_pre = FillRequest(
+    file_base64=b64_pre,
+    products=[{'product_name': 'IGNORED', 'brand_name': 'X', 'allergen_details': [], 'certifications': []}],
+    retailer_name='Precomputed',
+    fill_mode='auto',
+    form_spec={
+        'data_sheet': 'Product details',
+        'layout': 'horizontal_rows',
+        'header_row': 8,
+        'first_data_row': 10,
+        'example_rows': [9],
+        'other_sheets': [],
+        'field_map': [],
+    },
+    precomputed_mappings=[
+        {'sheet_name': 'Product details', 'row': 10, 'col': 2, 'value': 'From Step 3', 'field_label': 'Product Name'},
+        {'sheet_name': 'Product details', 'row': 10, 'col': 3, 'value': 'Brand Co', 'field_label': 'Brand'},
+        {'sheet_name': 'Product details', 'row': 10, 'col': 4, 'value': '12.99', 'field_label': 'RRP'},
+    ],
+)
+res_pre = asyncio.run(fill_nlf(req_pre))
+out_pre = openpyxl.load_workbook(io.BytesIO(base64.b64decode(res_pre['file_base64'])))
+ws_pre_out = out_pre['Product details ']
+precomputed_ok = (
+    res_pre['fields_filled'] > 0
+    and ws_pre_out.cell(row=10, column=2).value == 'From Step 3'
+    and ws_pre_out.cell(row=9, column=2).value == 'Example line'
+)
+print(f'{"PASS" if precomputed_ok else "FAIL"} | Precomputed Step 3 mappings written to sheet')
+results.append(precomputed_ok)
+
 print()
 print('--- Missing API key / Claude mock tests ---')
 

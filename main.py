@@ -39,6 +39,7 @@ class FillRequest(BaseModel):
     retailer_name: str
     fill_mode: str = 'auto'
     form_spec: Optional[Dict[str, Any]] = None
+    precomputed_mappings: Optional[List[Dict[str, Any]]] = None
 
 
 def get_anthropic_api_key() -> Optional[str]:
@@ -847,6 +848,48 @@ def count_header_labels(ws, header_row):
     return count
 
 
+def col_to_index(col):
+    if col is None:
+        return None
+    if isinstance(col, int):
+        return col if col > 0 else None
+    s = str(col).strip()
+    if not s:
+        return None
+    if s.isdigit():
+        return int(s)
+    n = 0
+    for ch in s.upper():
+        if not ('A' <= ch <= 'Z'):
+            return None
+        n = n * 26 + (ord(ch) - 64)
+    return n if n > 0 else None
+
+
+def apply_precomputed_mappings(wb, mappings, plan):
+    """Write Step 3 precomputed field/value pairs — source of truth before map_field."""
+    if not mappings:
+        return 0
+    sheet_default = plan.get('sheet_used')
+    filled = 0
+    for entry in mappings:
+        sheet_name = resolve_sheet_name(wb, entry.get('sheet_name')) or sheet_default
+        if not sheet_name or sheet_name not in wb.sheetnames:
+            continue
+        ws = wb[sheet_name]
+        row = entry.get('row')
+        col = col_to_index(entry.get('col'))
+        value = entry.get('value')
+        if not row or not col or value is None or str(value).strip() == '':
+            continue
+        existing = ws.cell(row=int(row), column=int(col))
+        if is_formula_cell(existing):
+            continue
+        if safe_write(ws, int(row), int(col), str(value)):
+            filled += 1
+    return filled
+
+
 def resolve_fill_plan(wb, form_spec, fill_mode):
     spec = form_spec or {}
     sheet_used = resolve_sheet_name(wb, spec.get('data_sheet'))
@@ -1258,9 +1301,18 @@ async def fill_nlf(req: FillRequest):
         all_issues_fixed = []
 
         plan = resolve_fill_plan(wb, req.form_spec, req.fill_mode)
+
         total_filled, all_issues_fixed, labels_found_count = execute_fill(
             wb, req.products, plan, req.fill_mode,
         )
+
+        precomputed_filled = 0
+        if req.precomputed_mappings:
+            precomputed_filled = apply_precomputed_mappings(
+                wb, req.precomputed_mappings, plan,
+            )
+            labels_found_count = max(labels_found_count, len(req.precomputed_mappings))
+            total_filled = max(total_filled, precomputed_filled)
 
         formula_count_after = count_formula_cells(wb)
         if _FillGuard.formula_blocks > 0:
@@ -1291,6 +1343,7 @@ async def fill_nlf(req: FillRequest):
                     f"First data row: {plan.get('first_data_row_used')}. "
                     f"Labels found: {labels_found_count}. "
                     f"Products received: {len(req.products)}. "
+                    f"Precomputed mappings received: {len(req.precomputed_mappings or [])}. "
                     f"This indicates a layout detection or field matching failure."
                 ),
             )
