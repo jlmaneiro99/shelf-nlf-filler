@@ -80,6 +80,24 @@ class _FillGuard:
         cls.formula_blocks = 0
 
 
+class _WriteTracker:
+    """Records every (sheet, row, col) written so a single /fill request can be
+    audited for conflicting layout passes (e.g. a stray vertical dump mixed into
+    a horizontal fill)."""
+    writes = []
+    enabled = False
+
+    @classmethod
+    def reset(cls):
+        cls.writes = []
+        cls.enabled = True
+
+    @classmethod
+    def record(cls, sheet, row, col):
+        if cls.enabled:
+            cls.writes.append((sheet, int(row), int(col)))
+
+
 def is_formula_cell(cell):
     if isinstance(cell, MergedCell):
         return False
@@ -112,6 +130,7 @@ def safe_write(ws, row, col, value):
                 if len(str(value)) > 500:
                     value = str(value)[:500]
                 target.value = value
+                _WriteTracker.record(ws.title, target.row, target.column)
                 return True
         return False
     if is_formula_cell(cell):
@@ -120,6 +139,7 @@ def safe_write(ws, row, col, value):
     if len(str(value)) > 500:
         value = str(value)[:500]
     cell.value = value
+    _WriteTracker.record(ws.title, row, col)
     return True
 
 
@@ -151,6 +171,33 @@ def safe_str(value, default='N/A'):
     if s == '' or s == 'None' or s == 'null':
         return default
     return s
+
+
+def norm_label(label):
+    """Normalise a field label for matching: lower, collapse whitespace, drop trailing *."""
+    if label is None:
+        return ''
+    return re.sub(r'\s+', ' ', str(label).lower().replace('*', ' ')).strip()
+
+
+def is_junk_header(label):
+    """A header cell that is not a real field: blank, purely numeric (e.g. corrupted
+    merged value '1.65'), or shorter than 3 characters."""
+    if label is None:
+        return True
+    s = str(label).strip()
+    if len(s) < 3:
+        return True
+    cleaned = s.replace(',', '').replace('%', '').replace('£', '').replace('$', '').strip()
+    if re.fullmatch(r'-?\d+(\.\d+)?', cleaned):
+        return True
+    return False
+
+
+def is_formula_computed_field(label):
+    """Fields the form computes itself via a formula — never write a value directly."""
+    n = norm_label(label)
+    return 'margin' in n
 
 
 def has_cert(p, *keywords):
@@ -316,12 +363,19 @@ def map_field(label_raw, product):
                                   'supplier company']):
         return safe_str(p.get('supplier_name') or p.get('brand_name'), '')
 
+    # Customs/tariff codes must NEVER receive the SKU — handle them first.
+    if any(x in label for x in ['commodity code', 'commodity', 'hs code', 'hs/commodity',
+                                  'hs / commodity', 'hts code', 'tariff code', 'tariff',
+                                  'customs code', 'import code', 'meursing']):
+        if 'meursing' in label:
+            return safe_str(p.get('meursing_code'))
+        return safe_str(p.get('hs_commodity_code'))
+
     if any(x in label for x in ['sku', 'supplier code', 'supplier reference',
                                   'reference code', 'supplier ref',
                                   'your code', 'vendor code',
                                   'article number', 'item code',
-                                  'product code', 'supplier item code',
-                                  'commodity code']) and 'hs' not in label and 'tariff' not in label:
+                                  'product code', 'supplier item code']):
         return safe_str(p.get('sku_code'), '')
 
     if any(x in label for x in ['case barcode', 'outer barcode',
@@ -705,6 +759,18 @@ def map_field(label_raw, product):
                  'salt (g per 100g)', 'salt g per 100g']:
         return nutritional_value(p.get('salt'), label, serving)
 
+    # Bare single-word packaging-material headers ("Other", "Paper", "Glass",
+    # "Plastic", "Card", "Metal", "Aluminium") are column sub-headers, not fields.
+    # Never return junk weights/values for them unless explicit material data exists.
+    if norm_label(label) in ('other', 'paper', 'glass', 'plastic', 'card',
+                              'cardboard', 'metal', 'aluminium', 'aluminum',
+                              'steel', 'tin', 'wood', 'none'):
+        material = norm_label(label)
+        explicit = p.get(f'packaging_{material}_weight_g') or p.get(f'packaging_{material}')
+        if explicit:
+            return safe_str(explicit)
+        return None
+
     if any(x in label for x in ['inner packaging material',
                                   'packaging material', 'packaging type',
                                   'primary packaging']):
@@ -867,7 +933,10 @@ def col_to_index(col):
 
 
 def apply_precomputed_mappings(wb, mappings, plan):
-    """Write Step 3 precomputed field/value pairs — source of truth before map_field."""
+    """Write Step 3 precomputed field/value pairs using their carried coordinates.
+    Only used for NON horizontal_rows layouts (vertical / columns) where the
+    coordinates are valid for that layout. Horizontal_rows rebuilds coordinates
+    inside fill_horizontal_rows instead."""
     if not mappings:
         return 0
     sheet_default = plan.get('sheet_used')
@@ -882,12 +951,55 @@ def apply_precomputed_mappings(wb, mappings, plan):
         value = entry.get('value')
         if not row or not col or value is None or str(value).strip() == '':
             continue
+        if is_formula_computed_field(entry.get('field_label') or entry.get('label')):
+            continue  # FIX 5 — never write a margin field directly
         existing = ws.cell(row=int(row), column=int(col))
-        if is_formula_cell(existing):
+        if is_formula_cell(existing):  # FIX 5 — formula protection
             continue
         if safe_write(ws, int(row), int(col), str(value)):
             filled += 1
     return filled
+
+
+def check_write_conflict(plan, num_products):
+    """FIX 4 — abort if a single request produced conflicting layout passes
+    (e.g. a vertical column dump mixed into a horizontal fill)."""
+    from collections import defaultdict
+    sheet = plan.get('sheet_used')
+    layout = plan.get('layout_used')
+    writes = [(r, c) for (s, r, c) in _WriteTracker.writes if s == sheet]
+    if not writes:
+        return None
+
+    rows_by_col = defaultdict(set)
+    cols_by_row = defaultdict(set)
+    for r, c in writes:
+        rows_by_col[c].add(r)
+        cols_by_row[r].add(c)
+
+    if layout == 'horizontal_rows':
+        first = plan.get('first_data_row_used')
+        if first:
+            allowed = {first + i for i in range(max(num_products, 1))}
+            stray = sorted({r for (r, c) in writes if r not in allowed})
+            wide = any(len(cols) >= 5 for cols in cols_by_row.values())
+            tall = any(len(rows) >= 5 for rows in rows_by_col.values())
+            if stray and (wide or tall):
+                return (
+                    f"Layout conflict detected: a horizontal_rows fill also wrote to "
+                    f"non-product rows {stray[:10]} on sheet '{sheet}'. A vertical dump "
+                    f"was mixed into a horizontal fill — file not returned."
+                )
+    else:
+        vertical = any(len(rows) >= 5 for rows in rows_by_col.values())
+        horizontal = any(len(cols) >= 5 for cols in cols_by_row.values())
+        if vertical and horizontal:
+            return (
+                f"Layout conflict detected: both a vertical (one column, many rows) and "
+                f"a horizontal (one row, many columns) write pattern occurred on sheet "
+                f"'{sheet}' — file not returned."
+            )
+    return None
 
 
 def resolve_fill_plan(wb, form_spec, fill_mode):
@@ -1039,21 +1151,50 @@ def fill_single_sheet(ws, product, value_col=3, label_col=2, example_rows=None):
     return filled, issues_fixed
 
 
-def fill_horizontal_rows(ws, products, plan):
+def build_precomputed_by_label(precomputed):
+    """Step 3 mappings → {product_index: {norm_label: value}}.
+
+    For horizontal_rows any row/col coordinates carried by the mapping are
+    DISCARDED — coordinates are rebuilt for the horizontal layout. Only the
+    field label and value are trusted."""
+    by_index = {}
+    for entry in precomputed or []:
+        label = entry.get('field_label') or entry.get('label')
+        value = entry.get('value')
+        if not label or value is None or str(value).strip() == '':
+            continue
+        idx = entry.get('product_index')
+        try:
+            idx = int(idx) if idx is not None else 0
+        except (TypeError, ValueError):
+            idx = 0
+        by_index.setdefault(idx, {})[norm_label(label)] = str(value)
+    return by_index
+
+
+def fill_horizontal_rows(ws, products, plan, precomputed=None):
     header_row = plan.get('header_row_used')
     first_data_row = plan.get('first_data_row_used')
     if not header_row or not first_data_row:
         return 0, [], plan.get('labels_found_count', 0)
 
     example_rows = set(plan.get('example_rows') or [])
+    pre_by_index = build_precomputed_by_label(precomputed)
+
     headers = {}
     for cell in ws[header_row]:
         if isinstance(cell, MergedCell):
             continue
-        if cell.value and not str(cell.value).strip().startswith('='):
-            label = str(cell.value).strip()
-            if label:
-                headers[cell.column] = label
+        if not cell.value:
+            continue
+        label = str(cell.value).strip()
+        if label.startswith('='):
+            continue
+        if is_junk_header(label):              # FIX 6 — skip numeric/short junk headers
+            continue
+        if is_formula_computed_field(label):   # FIX 5 — never write margin etc.
+            continue
+        headers[cell.column] = label
 
     labels_found_count = len(headers)
     total_filled = 0
@@ -1063,12 +1204,16 @@ def fill_horizontal_rows(ws, products, plan):
         target_row = first_data_row + i
         if target_row in example_rows:
             continue
+        pre = pre_by_index.get(i, {})
         unresolved = []
         for col, label in headers.items():
             existing = ws.cell(row=target_row, column=col)
-            if is_formula_cell(existing):
+            if is_formula_cell(existing):       # FIX 5 — formula protection
                 continue
-            value = map_field(label, product)
+            # Step 3 precomputed value is the source of truth when present.
+            value = pre.get(norm_label(label))
+            if value is None:
+                value = map_field(label, product)
             if value is not None:
                 if value in ('None', 'null', ''):
                     value = 'N/A'
@@ -1091,7 +1236,7 @@ def fill_horizontal_rows(ws, products, plan):
     return total_filled, all_issues, labels_found_count
 
 
-def execute_fill(wb, products, plan, fill_mode):
+def execute_fill(wb, products, plan, fill_mode, precomputed=None):
     ws = wb[plan['sheet_used']]
     layout = plan['layout_used']
     total_filled = 0
@@ -1099,7 +1244,11 @@ def execute_fill(wb, products, plan, fill_mode):
     labels_found_count = plan.get('labels_found_count', 0)
 
     if layout == 'horizontal_rows':
-        total_filled, all_issues, labels_found_count = fill_horizontal_rows(ws, products, plan)
+        # Single authoritative pass — precomputed Step 3 values applied INSIDE,
+        # with coordinates rebuilt for the horizontal layout (no vertical dump).
+        total_filled, all_issues, labels_found_count = fill_horizontal_rows(
+            ws, products, plan, precomputed,
+        )
         return total_filled, all_issues, labels_found_count
 
     if layout == 'horizontal_columns':
@@ -1295,24 +1444,36 @@ async def fill_nlf(req: FillRequest):
         file_bytes = base64.b64decode(req.file_base64)
         wb = openpyxl.load_workbook(io.BytesIO(file_bytes))
         _FillGuard.reset()
+        _WriteTracker.reset()
         formula_count_before = count_formula_cells(wb)
 
         total_filled = 0
         all_issues_fixed = []
 
+        # Resolve the layout ONCE — this is the single authoritative layout.
         plan = resolve_fill_plan(wb, req.form_spec, req.fill_mode)
+        resolved_layout = plan['layout_used']
 
+        # EXACTLY ONE fill pass. For horizontal_rows the precomputed Step 3 values
+        # are applied inside the pass with horizontal coordinates. For other layouts
+        # the precomputed values (which carry layout-valid coordinates) overlay the
+        # map_field fill afterwards — never as a conflicting independent layout.
         total_filled, all_issues_fixed, labels_found_count = execute_fill(
             wb, req.products, plan, req.fill_mode,
+            precomputed=req.precomputed_mappings,
         )
 
-        precomputed_filled = 0
-        if req.precomputed_mappings:
+        if resolved_layout != 'horizontal_rows' and req.precomputed_mappings:
             precomputed_filled = apply_precomputed_mappings(
                 wb, req.precomputed_mappings, plan,
             )
             labels_found_count = max(labels_found_count, len(req.precomputed_mappings))
             total_filled = max(total_filled, precomputed_filled)
+
+        # FIX 4 — conflict guard: never return a file corrupted by two layout passes.
+        conflict = check_write_conflict(plan, len(req.products))
+        if conflict:
+            raise HTTPException(status_code=422, detail=conflict)
 
         formula_count_after = count_formula_cells(wb)
         if _FillGuard.formula_blocks > 0:

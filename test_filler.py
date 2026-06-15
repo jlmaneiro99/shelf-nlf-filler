@@ -414,6 +414,171 @@ print(f'{"PASS" if precomputed_ok else "FAIL"} | Precomputed Step 3 mappings wri
 results.append(precomputed_ok)
 
 print()
+print('--- Double-layout / single-pass conflict tests ---')
+
+import main as _m
+from openpyxl.utils import get_column_letter as _gcl
+
+
+def _build_dundeis_wb():
+    """73-ish label horizontal form: header row 8, example row 9, formula col V,
+    a junk numeric header, a commodity column, and bare packaging headers."""
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = 'Product details '  # trailing space on purpose
+    labels = {
+        2: 'Product Name', 3: 'Brand', 4: 'RRP', 5: 'Wholesale Price per Case (ex VAT)',
+        6: 'Storage Conditions', 7: 'Country of Origin', 8: 'Commodity Code (10 digit)',
+        9: 'Other', 10: 'Paper', 11: 'Energy kcal per 100g', 12: 'Protein g per 100g',
+    }
+    for col, text in labels.items():
+        ws.cell(row=8, column=col).value = text
+    ws.cell(row=8, column=22).value = 'RRP Margin'   # col V = formula field
+    ws.cell(row=8, column=23).value = '1.65'          # junk numeric header (col W)
+    # example row 9
+    ws.cell(row=9, column=2).value = '1. Example line'
+    ws.cell(row=9, column=3).value = 'Salted Peanuts'
+    ws.cell(row=9, column=9).value = '13g'            # example junk for "Other"
+    ws.cell(row=9, column=23).value = 'EXAMPLE'
+    # formula in col V for the (future) product rows so it must be protected
+    for r in range(10, 15):
+        ws.cell(row=r, column=22).value = '=(U{0}-(S{0}*(1+W{0})))/U{0}'.format(r)
+    other = wb.create_sheet('Marketing content')
+    other['A1'] = 'do not touch'
+    other['B2'] = '=A1'
+    return wb
+
+
+dundeis_products = [
+    {
+        'product_name': f'Granola {i}', 'brand_name': 'Mi-Eco', 'rrp': 4.99 + i,
+        'trade_price_per_case': 17.52, 'storage_conditions': 'Ambient',
+        'country_of_origin': 'Bulgaria', 'sku_code': 'FN-PEA-VAN-500',
+        'hs_commodity_code': '1904100000', 'energy_kcal': 422, 'protein': 17,
+        'allergen_details': [], 'certifications': [],
+    }
+    for i in range(5)
+]
+spec_h = {
+    'data_sheet': 'Product details',
+    'layout': 'horizontal_rows',
+    'header_row': 8,
+    'first_data_row': 10,
+    'example_rows': [9],
+    'other_sheets': ['Marketing content'],
+    'field_map': [],
+}
+
+
+def _run_dundeis(precomputed=None):
+    wb = _build_dundeis_wb()
+    buf = io.BytesIO()
+    wb.save(buf)
+    req = FillRequest(
+        file_base64=base64.b64encode(buf.getvalue()).decode(),
+        products=dundeis_products,
+        retailer_name='Dundeis',
+        fill_mode='auto',
+        form_spec=spec_h,
+        precomputed_mappings=precomputed,
+    )
+    res = asyncio.run(fill_nlf(req))
+    out = openpyxl.load_workbook(io.BytesIO(base64.b64decode(res['file_base64'])))
+    return res, out['Product details ']
+
+
+# 5 products in rows 10-14, NO vertical dump in any single column
+res_d, ws_d = _run_dundeis()
+rows_ok = all(ws_d.cell(row=10 + i, column=2).value == f'Granola {i}' for i in range(5))
+# column C (3) must NOT contain a stacked vertical product (only header 8 +
+# example row 9 + product rows 10-14 may be populated)
+col_c_rows = [r for r in range(9, 90) if ws_d.cell(row=r, column=3).value not in (None, '')]
+no_vertical_dump = set(col_c_rows).issubset({9, 10, 11, 12, 13, 14})  # 9 = example brand
+example_safe = ws_d.cell(row=9, column=2).value == '1. Example line'
+print(f'{"PASS" if rows_ok and no_vertical_dump and example_safe else "FAIL"} '
+      f'| 5 products in rows 10-14, no vertical dump in column C, example row intact')
+results.append(rows_ok and no_vertical_dump and example_safe)
+
+# Formula column V never overwritten on any product row
+v_formula_ok = all(
+    str(ws_d.cell(row=10 + i, column=22).value).startswith('=') for i in range(5)
+)
+print(f'{"PASS" if v_formula_ok else "FAIL"} | Formula column V preserved on all product rows')
+results.append(v_formula_ok)
+
+# Junk numeric header column ("1.65", col W=23) skipped entirely
+junk_skipped = all(ws_d.cell(row=10 + i, column=23).value in (None, '') for i in range(5))
+print(f'{"PASS" if junk_skipped else "FAIL"} | Numeric/junk header column ("1.65") skipped')
+results.append(junk_skipped)
+
+# Commodity code column gets the HS code, NEVER the SKU
+commodity_val = ws_d.cell(row=10, column=8).value
+commodity_ok = commodity_val == '1904100000' and commodity_val != 'FN-PEA-VAN-500'
+print(f'{"PASS" if commodity_ok else "FAIL"} | Commodity code = HS code, not SKU (got {commodity_val!r})')
+results.append(commodity_ok)
+
+# Bare "Other"/"Paper" packaging headers stay blank (no "13g" junk, no example leak)
+packaging_blank = all(
+    ws_d.cell(row=10 + i, column=9).value in (None, '')
+    and ws_d.cell(row=10 + i, column=10).value in (None, '')
+    for i in range(5)
+)
+print(f'{"PASS" if packaging_blank else "FAIL"} | Bare packaging headers ("Other"/"Paper") blank, no example leak')
+results.append(packaging_blank)
+
+# map_field never returns SKU for commodity/hs/tariff/meursing
+commodity_map_ok = (
+    _m.map_field('Commodity Code (10 digit)', dundeis_products[0]) == '1904100000'
+    and _m.map_field('HS Code', dundeis_products[0]) == '1904100000'
+    and _m.map_field('Tariff Code', dundeis_products[0]) != 'FN-PEA-VAN-500'
+)
+print(f'{"PASS" if commodity_map_ok else "FAIL"} | map_field: commodity/hs/tariff never return SKU')
+results.append(commodity_map_ok)
+
+# Example row values never propagate: a field not in the vault stays blank
+example_no_leak = _m.map_field('Shelf Ready Case', dundeis_products[0]) is None
+print(f'{"PASS" if example_no_leak else "FAIL"} | Unknown vault field returns None (no example leakage)')
+results.append(example_no_leak)
+
+# A stray vertical-coordinate precomputed payload on a horizontal form is
+# rebuilt to horizontal rows — it must NOT create a vertical column dump.
+vertical_payload = [
+    {'sheet_name': 'Product details', 'row': 4, 'col': 3, 'value': 'VDUMP-Name', 'field_label': 'Product Name', 'product_index': 0},
+    {'sheet_name': 'Product details', 'row': 15, 'col': 3, 'value': 'Ambient', 'field_label': 'Storage Conditions', 'product_index': 0},
+    {'sheet_name': 'Product details', 'row': 75, 'col': 3, 'value': '422', 'field_label': 'Energy kcal per 100g', 'product_index': 0},
+]
+res_v, ws_v = _run_dundeis(precomputed=vertical_payload)
+# rows 4/15/75 in column C must be untouched; product name landed in row 10
+c4 = ws_v.cell(row=4, column=3).value
+c15 = ws_v.cell(row=15, column=3).value
+c75 = ws_v.cell(row=75, column=3).value
+no_legacy_vertical = c4 in (None, '') and c15 in (None, '') and c75 in (None, '')
+print(f'{"PASS" if no_legacy_vertical else "FAIL"} '
+      f'| Vertical-coord precomputed rebuilt horizontally (C4/C15/C75 untouched)')
+results.append(no_legacy_vertical)
+
+# Conflict guard: a genuine vertical dump injected via safe_write triggers 422
+conflict_caught = False
+try:
+    wb_cf = _build_dundeis_wb()
+    plan_cf = _m.resolve_fill_plan(wb_cf, spec_h, 'auto')
+    _m._WriteTracker.reset()
+    ws_cf = wb_cf[plan_cf['sheet_used']]
+    # simulate horizontal fill (wide rows 10-14)
+    for i in range(5):
+        for c in range(2, 13):
+            _m.safe_write(ws_cf, 10 + i, c, 'x')
+    # simulate stray vertical dump down column C across many non-product rows
+    for r in [4, 5, 6, 15, 51, 75, 76, 77]:
+        _m.safe_write(ws_cf, r, 3, 'dump')
+    conflict_msg = _m.check_write_conflict(plan_cf, 5)
+    conflict_caught = conflict_msg is not None and 'conflict' in conflict_msg.lower()
+except Exception:
+    conflict_caught = False
+print(f'{"PASS" if conflict_caught else "FAIL"} | Conflicting double-layout write triggers conflict (422)')
+results.append(conflict_caught)
+
+print()
 print('--- Missing API key / Claude mock tests ---')
 
 import main as main_mod
