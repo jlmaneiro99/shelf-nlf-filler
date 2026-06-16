@@ -534,19 +534,70 @@ _ancestral = {
     'units_per_case': 12,
     'weight_unit': 'g',
     'cost_price_per_case': None,
+    'inner_plastic_weight_g': 13,
 }
 _trade_unit = _m.trade_price_per_unit(_ancestral)
 ancestral_fields_ok = (
     _m.map_field('Unit Size', _ancestral) == '40'
     and _m.map_field('UOM', _ancestral) == 'g'
     and _m.map_field('Trade Case Cost', _ancestral) == '14.5'
+    and _m.map_field('Case Cost - Trade', _ancestral) == '14.5'
     and _m.map_field('Trade Unit Cost', _ancestral) == _trade_unit
     and _m.map_field('Dundeis Case Cost', _ancestral) == 'N/A'
     and _m.map_field('Dundeis Unit Cost', _ancestral) == 'N/A'
     and _m.map_field('Other', _ancestral) == 'N/A'
+    and _m.map_field('Product Name & Description', _ancestral) == 'Alchemy Bites'
 )
 print(f'{"PASS" if ancestral_fields_ok else "FAIL"} | Unit Size/UOM/trade costs + Other=N/A for Ancestral shape')
 results.append(ancestral_fields_ok)
+
+# Variant-only fallback when unit_net_weight_g missing
+_variant_only = {
+    'variant': '40g',
+    'trade_price_per_case': 14.5,
+    'units_per_case': 12,
+}
+variant_fallback_ok = (
+    _m.map_field('Unit Size', _variant_only) == '40'
+    and _m.map_field('UOM', _variant_only) == 'g'
+)
+print(f'{"PASS" if variant_fallback_ok else "FAIL"} | Unit Size/UOM from variant when weight missing')
+results.append(variant_fallback_ok)
+
+# Empty precomputed must not block map_field
+pre_empty_ok = True
+try:
+    wb_pe = _build_dundeis_wb()
+    wb_pe.active.cell(row=8, column=24).value = 'Unit Size'
+    wb_pe.active.cell(row=8, column=25).value = 'Trade Case Cost'
+    spec_pe = {**spec_h, 'field_map': [
+        {'label': 'Unit Size', 'col': 24},
+        {'label': 'Trade Case Cost', 'col': 25},
+    ]}
+    plan_pe = _m.resolve_fill_plan(wb_pe, spec_pe, 'auto')
+    _m._WriteTracker.reset()
+    ws_pe = wb_pe[plan_pe['sheet_used']]
+    ancestral_fill = [{
+        'product_name': 'Alchemy Bites', 'unit_net_weight_g': 40,
+        'trade_price_per_case': 14.5, 'units_per_case': 12, 'allergen_details': [],
+    }]
+    filled_pe, _, _ = _m.fill_horizontal_rows(
+        ws_pe, ancestral_fill, plan_pe,
+        precomputed=[{
+            'field_label': 'Unit Size', 'value': '', 'product_index': 0,
+        }, {
+            'field_label': 'Trade Case Cost', 'value': '   ', 'product_index': 0,
+        }],
+    )
+    pre_empty_ok = (
+        ws_pe.cell(row=10, column=24).value == '40'
+        and ws_pe.cell(row=10, column=25).value == '14.5'
+    )
+except Exception as exc:
+    print(f'pre_empty test error: {exc}')
+    pre_empty_ok = False
+print(f'{"PASS" if pre_empty_ok else "FAIL"} | Empty precomputed falls back to map_field')
+results.append(pre_empty_ok)
 
 # map_field never returns SKU for commodity/hs/tariff/meursing
 commodity_map_ok = (

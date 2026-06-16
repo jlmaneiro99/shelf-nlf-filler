@@ -208,7 +208,16 @@ BARE_PACKAGING_HEADERS = frozenset({
 
 def is_bare_packaging_material_header(label):
     """Single-word packaging material column headers — not product data fields."""
-    return norm_label(label) in BARE_PACKAGING_HEADERS
+    n = norm_label(label)
+    if n in BARE_PACKAGING_HEADERS:
+        return True
+    first = n.split()[0] if n else ''
+    if first in BARE_PACKAGING_HEADERS:
+        return True
+    return bool(re.match(
+        r'^(other|paper|glass|plastic|card|cardboard|metal|aluminium|aluminum|steel|tin|wood|none)(\*|\s|\(|$)',
+        n,
+    ))
 
 
 def unit_uom(p):
@@ -251,6 +260,76 @@ def cost_price_per_unit(p):
         return str(v)
     except (TypeError, ValueError, ZeroDivisionError):
         return None
+
+
+def _format_numeric_size(val):
+    try:
+        fv = float(val)
+        if fv == int(fv):
+            return str(int(fv))
+        return str(val).strip()
+    except (TypeError, ValueError):
+        return safe_str(val, '')
+
+
+def parse_unit_size_from_product(p):
+    """Numeric unit size from unit_net_weight_g, unit_size alias, or variant (e.g. 40g)."""
+    uw = p.get('unit_net_weight_g')
+    if uw is not None and str(uw).strip() not in ('', 'None', 'null'):
+        formatted = _format_numeric_size(uw)
+        if formatted:
+            return formatted
+    us = p.get('unit_size')
+    if us is not None and str(us).strip() not in ('', 'None', 'null'):
+        formatted = _format_numeric_size(us)
+        if formatted:
+            return formatted
+    variant = safe_str(p.get('variant'), '').strip()
+    if variant:
+        m = re.match(r'^(\d+(?:\.\d+)?)\s*([a-zA-Z]+)?\s*$', variant.replace(' ', ''))
+        if m:
+            return _format_numeric_size(m.group(1))
+    return ''
+
+
+def parse_uom_from_product(p):
+    """Unit of measure from weight_unit or variant suffix (40g → g)."""
+    variant = safe_str(p.get('variant'), '').strip().replace(' ', '')
+    if variant:
+        m = re.match(r'^\d+(?:\.\d+)?([a-zA-Z]+)$', variant)
+        if m:
+            u = m.group(1).lower()
+            if u == 'kg':
+                return 'g'
+            if u in ('l', 'litre', 'liter', 'ltr', 'liters', 'litres'):
+                return 'ml'
+            if u in ('g', 'ml'):
+                return u
+    return unit_uom(p)
+
+
+def is_trade_case_cost_label(label):
+    if 'trade case cost' in label:
+        return True
+    return 'case cost' in label and 'trade' in label
+
+
+def is_trade_unit_cost_label(label):
+    if 'trade unit cost' in label:
+        return True
+    return 'trade' in label and 'unit cost' in label
+
+
+def is_supplier_case_cost_label(label):
+    if 'dundeis case cost' in label:
+        return True
+    return 'case cost' in label and any(x in label for x in ('dundeis', 'supplier', 'landed'))
+
+
+def is_supplier_unit_cost_label(label):
+    if 'dundeis unit cost' in label:
+        return True
+    return 'unit cost' in label and any(x in label for x in ('dundeis', 'supplier', 'landed'))
 
 
 def has_cert(p, *keywords):
@@ -330,6 +409,8 @@ def resolve_values_for_labels(labels, product):
         else:
             unresolved.append(label)
     if unresolved:
+        unresolved = [l for l in unresolved if not is_bare_packaging_material_header(l)]
+    if unresolved:
         claude_vals = claude_resolve_fields(unresolved, product)
         for label in unresolved:
             v = claude_vals.get(label)
@@ -401,10 +482,18 @@ def map_field(label_raw, product):
     if is_allergen_field(label):
         return get_allergen_value(label, p.get('allergen_details', []))
 
-    if any(x in label for x in ['full product name', 'product name on pack',
-                                  'product name', 'name of product',
-                                  'article name', 'item name',
-                                  'product title']) and 'description' not in label:
+    # Bare packaging headers before any weight/size matchers (never leak inner_plastic etc.).
+    if is_bare_packaging_material_header(label):
+        material = norm_label(label).split()[0]
+        explicit = p.get(f'packaging_{material}_weight_g') or p.get(f'packaging_{material}')
+        if explicit:
+            return safe_str(explicit)
+        return 'N/A'
+
+    if re.search(r'\bproduct name\b', label) or label in (
+        'name of product', 'article name', 'item name', 'product title',
+        'full product name', 'product name on pack', 'product name *',
+    ):
         return safe_str(p.get('product_name'), '')
 
     if label in ['brand name', 'brand', 'brand / manufacturer',
@@ -450,7 +539,8 @@ def map_field(label_raw, product):
                                   'size / format', 'format', 'pack format']):
         return safe_str(p.get('variant'), '')
 
-    if 'product description' in label and 'usp' not in label and 'sell' not in label:
+    if ('product description' in label or re.search(r'\bdescription\b', label)) and \
+       'product name' not in label and 'usp' not in label and 'sell' not in label:
         return safe_str(p.get('product_description'), '')
 
     if any(x in label for x in ['usp', 'key claims', 'unique selling',
@@ -467,24 +557,27 @@ def map_field(label_raw, product):
     if label in ('unit size', 'unit size *') or (
         'unit size' in label and 'case' not in label and 'uom' not in label
     ):
-        return safe_str(p.get('unit_net_weight_g'), '')
+        size = parse_unit_size_from_product(p)
+        return size if size else 'N/A'
 
     if label in ('uom', 'uom *', 'unit uom', 'unit of measure', 'unit of measurement') or \
        label.startswith('uom '):
-        return unit_uom(p)
+        return parse_uom_from_product(p)
 
     # Trade / cost columns — label-specific (before generic wholesale/cost matchers)
-    if 'trade case cost' in label or (label.endswith('case cost') and 'trade' in label):
-        return safe_str(p.get('trade_price_per_case'), '')
+    if is_trade_case_cost_label(label):
+        v = p.get('trade_price_per_case')
+        return safe_str(v, 'N/A') if v is not None else 'N/A'
 
-    if 'trade unit cost' in label or ('trade' in label and 'unit cost' in label):
-        return safe_str(trade_price_per_unit(p), '')
+    if is_trade_unit_cost_label(label):
+        v = trade_price_per_unit(p)
+        return safe_str(v, 'N/A') if v is not None else 'N/A'
 
-    if 'dundeis case cost' in label or ('dundeis' in label and 'case cost' in label):
+    if is_supplier_case_cost_label(label):
         v = p.get('cost_price_per_case')
         return safe_str(v, 'N/A') if v is not None else 'N/A'
 
-    if 'dundeis unit cost' in label or ('dundeis' in label and 'unit cost' in label):
+    if is_supplier_unit_cost_label(label):
         v = cost_price_per_unit(p)
         return safe_str(v, 'N/A') if v is not None else 'N/A'
 
@@ -836,15 +929,6 @@ def map_field(label_raw, product):
        label in ['salt', 'salt *', 'salt g per 100g *',
                  'salt (g per 100g)', 'salt g per 100g']:
         return nutritional_value(p.get('salt'), label, serving)
-
-    # Bare single-word packaging-material headers ("Other", "Paper", …) are column
-    # sub-headers, not product fields. Never return junk/example weights (e.g. "13g").
-    if is_bare_packaging_material_header(label):
-        material = norm_label(label)
-        explicit = p.get(f'packaging_{material}_weight_g') or p.get(f'packaging_{material}')
-        if explicit:
-            return safe_str(explicit)
-        return 'N/A'
 
     if any(x in label for x in ['inner packaging material',
                                   'packaging material', 'packaging type',
@@ -1291,9 +1375,11 @@ def fill_horizontal_rows(ws, products, plan, precomputed=None):
             existing = ws.cell(row=target_row, column=col)
             if is_formula_cell(existing):       # FIX 5 — formula protection
                 continue
-            # Step 3 precomputed value is the source of truth when present.
-            value = pre.get(norm_label(label))
-            if value is None:
+            # Step 3 precomputed value is the source of truth when present and non-empty.
+            pre_val = pre.get(norm_label(label))
+            if pre_val is not None and str(pre_val).strip() != '':
+                value = pre_val
+            else:
                 value = map_field(label, product)
             if value is not None:
                 if value in ('None', 'null', ''):
