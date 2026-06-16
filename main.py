@@ -200,6 +200,59 @@ def is_formula_computed_field(label):
     return 'margin' in n
 
 
+BARE_PACKAGING_HEADERS = frozenset({
+    'other', 'paper', 'glass', 'plastic', 'card', 'cardboard',
+    'metal', 'aluminium', 'aluminum', 'steel', 'tin', 'wood', 'none',
+})
+
+
+def is_bare_packaging_material_header(label):
+    """Single-word packaging material column headers — not product data fields."""
+    return norm_label(label) in BARE_PACKAGING_HEADERS
+
+
+def unit_uom(p):
+    wu = safe_str(p.get('weight_unit'), '').lower()
+    if wu in ('g', 'ml'):
+        return wu
+    if wu == 'kg':
+        return 'g'
+    if wu in ('l', 'litre', 'liter', 'liters', 'litres'):
+        return 'ml'
+    fmt = safe_str(p.get('product_format'), '').lower()
+    if fmt in ('liquid', 'drink', 'beverage'):
+        return 'ml'
+    return 'g'
+
+
+def trade_price_per_unit(p):
+    trade = p.get('trade_price_per_case')
+    units = p.get('units_per_case')
+    if trade is None or not units:
+        return None
+    try:
+        v = round(float(trade) / float(units), 4)
+        if v == int(v):
+            return str(int(v))
+        return str(v)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+
+
+def cost_price_per_unit(p):
+    cost = p.get('cost_price_per_case')
+    units = p.get('units_per_case')
+    if cost is None or not units:
+        return None
+    try:
+        v = round(float(cost) / float(units), 4)
+        if v == int(v):
+            return str(int(v))
+        return str(v)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+
+
 def has_cert(p, *keywords):
     certs = [str(c).lower() for c in (p.get('certifications') or [])]
     return any(all(k in c for k in keywords) for c in certs)
@@ -409,6 +462,31 @@ def map_field(label_raw, product):
 
     if 'ingredient' in label:
         return safe_str(p.get('ingredients'))
+
+    # Unit Size / UOM — Dundeis, BP, and similar horizontal forms
+    if label in ('unit size', 'unit size *') or (
+        'unit size' in label and 'case' not in label and 'uom' not in label
+    ):
+        return safe_str(p.get('unit_net_weight_g'), '')
+
+    if label in ('uom', 'uom *', 'unit uom', 'unit of measure', 'unit of measurement') or \
+       label.startswith('uom '):
+        return unit_uom(p)
+
+    # Trade / cost columns — label-specific (before generic wholesale/cost matchers)
+    if 'trade case cost' in label or (label.endswith('case cost') and 'trade' in label):
+        return safe_str(p.get('trade_price_per_case'), '')
+
+    if 'trade unit cost' in label or ('trade' in label and 'unit cost' in label):
+        return safe_str(trade_price_per_unit(p), '')
+
+    if 'dundeis case cost' in label or ('dundeis' in label and 'case cost' in label):
+        v = p.get('cost_price_per_case')
+        return safe_str(v, 'N/A') if v is not None else 'N/A'
+
+    if 'dundeis unit cost' in label or ('dundeis' in label and 'unit cost' in label):
+        v = cost_price_per_unit(p)
+        return safe_str(v, 'N/A') if v is not None else 'N/A'
 
     if any(x in label for x in ['how will you promote', 'promotional plan',
                                   'promotional support', 'promotional activity',
@@ -759,17 +837,14 @@ def map_field(label_raw, product):
                  'salt (g per 100g)', 'salt g per 100g']:
         return nutritional_value(p.get('salt'), label, serving)
 
-    # Bare single-word packaging-material headers ("Other", "Paper", "Glass",
-    # "Plastic", "Card", "Metal", "Aluminium") are column sub-headers, not fields.
-    # Never return junk weights/values for them unless explicit material data exists.
-    if norm_label(label) in ('other', 'paper', 'glass', 'plastic', 'card',
-                              'cardboard', 'metal', 'aluminium', 'aluminum',
-                              'steel', 'tin', 'wood', 'none'):
+    # Bare single-word packaging-material headers ("Other", "Paper", …) are column
+    # sub-headers, not product fields. Never return junk/example weights (e.g. "13g").
+    if is_bare_packaging_material_header(label):
         material = norm_label(label)
         explicit = p.get(f'packaging_{material}_weight_g') or p.get(f'packaging_{material}')
         if explicit:
             return safe_str(explicit)
-        return None
+        return 'N/A'
 
     if any(x in label for x in ['inner packaging material',
                                   'packaging material', 'packaging type',
@@ -1226,7 +1301,8 @@ def fill_horizontal_rows(ws, products, plan, precomputed=None):
                 if safe_write(ws, target_row, col, value):
                     total_filled += 1
             else:
-                unresolved.append((col, label))
+                if not is_bare_packaging_material_header(label):
+                    unresolved.append((col, label))
         if unresolved:
             resolved = claude_resolve_fields([l for _, l in unresolved], product)
             for col, label in unresolved:

@@ -517,14 +517,36 @@ commodity_ok = commodity_val == '1904100000' and commodity_val != 'FN-PEA-VAN-50
 print(f'{"PASS" if commodity_ok else "FAIL"} | Commodity code = HS code, not SKU (got {commodity_val!r})')
 results.append(commodity_ok)
 
-# Bare "Other"/"Paper" packaging headers stay blank (no "13g" junk, no example leak)
+# Bare "Other"/"Paper" packaging headers get N/A (never example junk like "13g")
 packaging_blank = all(
-    ws_d.cell(row=10 + i, column=9).value in (None, '')
-    and ws_d.cell(row=10 + i, column=10).value in (None, '')
+    ws_d.cell(row=10 + i, column=9).value in (None, '', 'N/A')
+    and ws_d.cell(row=10 + i, column=10).value in (None, '', 'N/A')
     for i in range(5)
 )
-print(f'{"PASS" if packaging_blank else "FAIL"} | Bare packaging headers ("Other"/"Paper") blank, no example leak')
+print(f'{"PASS" if packaging_blank else "FAIL"} | Bare packaging headers ("Other"/"Paper") N/A, no example leak')
 results.append(packaging_blank)
+
+# Ancestral-style unit size, UOM, trade cost labels
+_ancestral = {
+    'product_name': 'Alchemy Bites',
+    'unit_net_weight_g': 40,
+    'trade_price_per_case': 14.5,
+    'units_per_case': 12,
+    'weight_unit': 'g',
+    'cost_price_per_case': None,
+}
+_trade_unit = _m.trade_price_per_unit(_ancestral)
+ancestral_fields_ok = (
+    _m.map_field('Unit Size', _ancestral) == '40'
+    and _m.map_field('UOM', _ancestral) == 'g'
+    and _m.map_field('Trade Case Cost', _ancestral) == '14.5'
+    and _m.map_field('Trade Unit Cost', _ancestral) == _trade_unit
+    and _m.map_field('Dundeis Case Cost', _ancestral) == 'N/A'
+    and _m.map_field('Dundeis Unit Cost', _ancestral) == 'N/A'
+    and _m.map_field('Other', _ancestral) == 'N/A'
+)
+print(f'{"PASS" if ancestral_fields_ok else "FAIL"} | Unit Size/UOM/trade costs + Other=N/A for Ancestral shape')
+results.append(ancestral_fields_ok)
 
 # map_field never returns SKU for commodity/hs/tariff/meursing
 commodity_map_ok = (
