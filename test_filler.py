@@ -693,6 +693,73 @@ print(f'{"PASS" if no_vertical and horizontal_filled else "FAIL"} '
       f'| Horizontal form (no form_spec): C15={c15!r} C75={c75!r} empty, rows filled')
 results.append(no_vertical and horizontal_filled)
 
+# Tabs mode: Step 3 precomputed for product 2 must NOT contaminate Product 1 tab
+def _build_suma_tabs_wb():
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = 'Product 1'
+    ws.cell(row=4, column=2).value = 'Suma Product Code'
+    ws.cell(row=5, column=2).value = 'Full Product Name'
+    ws.cell(row=6, column=2).value = 'Brand'
+    # Stale template junk (simulates Cold Brew example left on template tab)
+    ws.cell(row=5, column=3).value = 'Original Cold Brew Coffee'
+    ws.cell(row=6, column=3).value = 'Drift Coffee Co.'
+    wb.create_sheet('Additional')
+    return wb
+
+_suma_p0 = {
+    'product_name': 'Ancient Defence', 'brand_name': 'Ancestral Superfoods',
+    'sku_code': 'F-ADEF-100', 'allergen_details': [], 'certifications': [],
+}
+_suma_p1 = {
+    'product_name': 'Original Cold Brew Coffee', 'brand_name': 'Drift Coffee Co.',
+    'sku_code': 'DCC-CBR-ORI-250', 'allergen_details': [], 'certifications': [],
+}
+_suma_buf = io.BytesIO()
+_build_suma_tabs_wb().save(_suma_buf)
+_suma_precomputed = [
+    {'sheet_name': 'Product 1', 'row': 4, 'col': 3, 'value': 'F-ADEF-100',
+     'field_label': 'Suma Product Code', 'product_index': 0},
+    {'sheet_name': 'Product 1', 'row': 5, 'col': 3, 'value': 'Original Cold Brew Coffee',
+     'field_label': 'Full Product Name', 'product_index': 1},
+    {'sheet_name': 'Product 1', 'row': 6, 'col': 3, 'value': 'Drift Coffee Co.',
+     'field_label': 'Brand', 'product_index': 1},
+]
+req_suma = FillRequest(
+    file_base64=base64.b64encode(_suma_buf.getvalue()).decode(),
+    products=[_suma_p0, _suma_p1],
+    retailer_name='Suma',
+    fill_mode='tabs',
+    form_spec={'layout': 'vertical', 'data_sheet': 'Product 1', 'label_column': 2, 'value_column': 3},
+    precomputed_mappings=_suma_precomputed,
+)
+res_suma = asyncio.run(fill_nlf(req_suma))
+wb_suma = openpyxl.load_workbook(io.BytesIO(base64.b64decode(res_suma['file_base64'])))
+ws_p1 = wb_suma['Product 1']
+ws_p2 = wb_suma['Product 2']
+tabs_clean = (
+    ws_p1.cell(row=4, column=3).value == 'F-ADEF-100'
+    and ws_p1.cell(row=5, column=3).value == 'Ancient Defence'
+    and ws_p1.cell(row=6, column=3).value == 'Ancestral Superfoods'
+    and ws_p2.cell(row=5, column=3).value == 'Original Cold Brew Coffee'
+    and ws_p2.cell(row=6, column=3).value == 'Drift Coffee Co.'
+)
+print(f'{"PASS" if tabs_clean else "FAIL"} | Tabs Product 1 not contaminated by product 2 precomputed')
+results.append(tabs_clean)
+
+packaging_desc_ok = (
+    _m.map_field('Packaging Description - Item/Case', {
+        'product_description': 'Organic Functional Tea Blend',
+        'inner_packaging_material': 'Stand-up pouch',
+        'case_size_description': '12 x 100g',
+    }) == 'Stand-up pouch'
+    and _m.map_field('Packaging Description', {
+        'product_description': 'Organic Functional Tea Blend',
+    }) == 'N/A'
+)
+print(f'{"PASS" if packaging_desc_ok else "FAIL"} | Packaging Description never maps to product_description')
+results.append(packaging_desc_ok)
+
 print()
 print('--- Missing API key / Claude mock tests ---')
 

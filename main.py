@@ -540,8 +540,15 @@ def map_field(label_raw, product):
         return safe_str(p.get('variant'), '')
 
     if ('product description' in label or re.search(r'\bdescription\b', label)) and \
-       'product name' not in label and 'usp' not in label and 'sell' not in label:
+       'product name' not in label and 'usp' not in label and 'sell' not in label and \
+       'packaging description' not in label:
         return safe_str(p.get('product_description'), '')
+
+    if 'packaging description' in label:
+        v = safe_str(p.get('inner_packaging_material'))
+        if not v:
+            v = safe_str(p.get('case_size_description'))
+        return v if v else 'N/A'
 
     if any(x in label for x in ['usp', 'key claims', 'unique selling',
                                   'selling point', 'key benefit',
@@ -1091,17 +1098,50 @@ def col_to_index(col):
     return n if n > 0 else None
 
 
-def apply_precomputed_mappings(wb, mappings, plan):
+def clear_vertical_value_column(ws, value_col, example_rows=None, min_row=1):
+    """Remove stale template/example values before filling a vertical tab."""
+    example_rows = set(example_rows or [])
+    for row in ws.iter_rows(min_row=min_row):
+        for cell in row:
+            if isinstance(cell, MergedCell):
+                continue
+            if cell.column != value_col:
+                continue
+            if cell.row in example_rows:
+                continue
+            if is_formula_cell(cell):
+                continue
+            cell.value = None
+
+
+def sheet_for_precomputed_entry(wb, entry, plan, fill_mode, num_products):
+    """Route Step 3 coordinates to the correct tab in tabs-mode vertical fills."""
+    product_index = entry.get('product_index')
+    try:
+        idx = int(product_index) if product_index is not None else 0
+    except (TypeError, ValueError):
+        idx = 0
+
+    layout = plan.get('layout_used')
+    use_tabs = fill_mode in ('tabs',) or (fill_mode == 'auto' and num_products > 1)
+    if use_tabs and layout == 'vertical':
+        tab_name = f'Product {idx + 1}'
+        if tab_name in wb.sheetnames:
+            return tab_name
+
+    return resolve_sheet_name(wb, entry.get('sheet_name')) or plan.get('sheet_used')
+
+
+def apply_precomputed_mappings(wb, mappings, plan, fill_mode='auto', num_products=1):
     """Write Step 3 precomputed field/value pairs using their carried coordinates.
     Only used for NON horizontal_rows layouts (vertical / columns) where the
     coordinates are valid for that layout. Horizontal_rows rebuilds coordinates
     inside fill_horizontal_rows instead."""
     if not mappings:
         return 0
-    sheet_default = plan.get('sheet_used')
     filled = 0
     for entry in mappings:
-        sheet_name = resolve_sheet_name(wb, entry.get('sheet_name')) or sheet_default
+        sheet_name = sheet_for_precomputed_entry(wb, entry, plan, fill_mode, num_products)
         if not sheet_name or sheet_name not in wb.sheetnames:
             continue
         ws = wb[sheet_name]
@@ -1279,13 +1319,14 @@ def verify_fill(ws, products, value_col=3, label_col=2):
     return issues_fixed
 
 
-def fill_single_sheet(ws, product, value_col=3, label_col=2, example_rows=None):
+def fill_single_sheet(ws, product, value_col=3, label_col=2, example_rows=None, precomputed_by_label=None):
     print(
         f"[FILL_FN] fill_single_sheet (VERTICAL) ENTER sheet={ws.title!r} "
         f"value_col={value_col} label_col={label_col}",
         flush=True,
     )
     example_rows = set(example_rows or [])
+    pre = precomputed_by_label or {}
     fields = []
     for row in ws.iter_rows():
         for cell in row:
@@ -1307,8 +1348,14 @@ def fill_single_sheet(ws, product, value_col=3, label_col=2, example_rows=None):
 
     filled = 0
     for row, field_label in fields:
-        value = resolved.get(field_label)
+        pre_val = pre.get(norm_label(field_label))
+        if pre_val is not None and str(pre_val).strip() != '':
+            value = pre_val
+        else:
+            value = resolved.get(field_label)
         if value is not None:
+            if value in ('None', 'null', ''):
+                value = 'N/A'
             if safe_write(ws, row, value_col, value):
                 filled += 1
     issues_fixed = verify_fill(ws, [product], value_col, label_col)
@@ -1410,6 +1457,7 @@ def execute_fill(wb, products, plan, fill_mode, precomputed=None):
     total_filled = 0
     all_issues = []
     labels_found_count = plan.get('labels_found_count', 0)
+    pre_by_index = build_precomputed_by_label(precomputed)
 
     # ── Resolve the layout ONCE. Never silently fall through to a vertical
     # column dump: if the layout is unknown but a horizontal header row was
@@ -1502,12 +1550,12 @@ def execute_fill(wb, products, plan, fill_mode, precomputed=None):
                 continue
             if re.match(r'^product\s*\d+$', sheet_name.strip(), re.IGNORECASE):
                 del wb[sheet_name]
-        for row in wb[template_sheet_name].iter_rows(min_row=5):
-            for cell in row:
-                if not isinstance(cell, MergedCell) and cell.column == val_col:
-                    cell.value = None
+        clear_vertical_value_column(
+            wb[template_sheet_name], val_col, example_rows,
+        )
         filled, issues = fill_single_sheet(
             wb[template_sheet_name], products[0], val_col, label_col, example_rows,
+            precomputed_by_label=pre_by_index.get(0, {}),
         )
         total_filled += filled
         all_issues.extend(issues)
@@ -1523,25 +1571,30 @@ def execute_fill(wb, products, plan, fill_mode, precomputed=None):
                 new_ws.add_data_validation(deepcopy(dv))
             current_idx = wb.sheetnames.index(new_ws.title)
             wb.move_sheet(new_ws.title, offset=(template_idx + i - 1) - current_idx)
-            for row in new_ws.iter_rows(min_row=5):
-                for cell in row:
-                    if not isinstance(cell, MergedCell) and cell.column == val_col:
-                        cell.value = None
-            filled, issues = fill_single_sheet(new_ws, product, val_col, label_col, example_rows)
+            clear_vertical_value_column(new_ws, val_col, example_rows)
+            filled, issues = fill_single_sheet(
+                new_ws, product, val_col, label_col, example_rows,
+                precomputed_by_label=pre_by_index.get(i - 1, {}),
+            )
             total_filled += filled
             all_issues.extend(issues)
+        plan['tabs_fill_used'] = True
         return total_filled, all_issues, labels_found_count
 
     if fill_mode == 'columns':
         for i, product in enumerate(products):
             filled, issues = fill_single_sheet(
                 ws, product, value_col=val_col + i, label_col=label_col,
+                precomputed_by_label=pre_by_index.get(i, {}),
             )
             total_filled += filled
             all_issues.extend(issues)
         return total_filled, all_issues, labels_found_count
 
-    filled, issues = fill_single_sheet(ws, products[0], val_col, label_col, example_rows)
+    filled, issues = fill_single_sheet(
+        ws, products[0], val_col, label_col, example_rows,
+        precomputed_by_label=pre_by_index.get(0, {}),
+    )
     total_filled += filled
     all_issues.extend(issues)
     return total_filled, all_issues, labels_found_count
@@ -1663,9 +1716,11 @@ async def fill_nlf(req: FillRequest):
             precomputed=req.precomputed_mappings,
         )
 
-        if resolved_layout != 'horizontal_rows' and req.precomputed_mappings:
+        if resolved_layout != 'horizontal_rows' and req.precomputed_mappings and not plan.get('tabs_fill_used'):
             precomputed_filled = apply_precomputed_mappings(
                 wb, req.precomputed_mappings, plan,
+                fill_mode=req.fill_mode,
+                num_products=len(req.products),
             )
             labels_found_count = max(labels_found_count, len(req.precomputed_mappings))
             total_filled = max(total_filled, precomputed_filled)
