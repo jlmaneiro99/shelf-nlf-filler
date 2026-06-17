@@ -205,6 +205,52 @@ BARE_PACKAGING_HEADERS = frozenset({
     'metal', 'aluminium', 'aluminum', 'steel', 'tin', 'wood', 'none',
 })
 
+RETAILER_CODE_QUALIFIERS = frozenset({
+    'suma', 'ocado', 'tesco', 'sainsbury', 'waitrose', 'morrisons', 'asda',
+    'dunnes', 'dundeis', 'clf', 'spark', 'boots', 'costco', 'whole foods',
+    'wholefoods', 'trader joe', 'kroger', 'walmart', 'heb', 'loblaws', 'coles',
+    'woolworths', 'amazon', 'delhaize', 'metro', 'carrefour', 'aldi', 'lidl',
+    'target', 'safeway',
+})
+
+
+def is_supplier_code_field(label):
+    """Supplier/vendor SKU fields — safe to fill with sku_code."""
+    n = norm_label(label)
+    if any(x in n for x in (
+        'supplier product code', 'supplier reference', 'supplier ref',
+        'supplier code', 'supplier sku', 'your code', 'vendor code',
+        'vendor ref', 'supplier item code',
+    )):
+        return 'retailer' not in n and 'etail' not in n and 'buyer' not in n
+    if re.search(r'\bsku\b', n) and not any(x in n for x in ('retailer', 'etail', 'buyer', 'suma', 'ocado', 'tesco')):
+        return True
+    if re.search(r'\bsku\s*/\s*supplier\b', n):
+        return True
+    return False
+
+
+def is_retailer_owned_code_field(label):
+    """Retailer/buyer-assigned codes — supplier leaves blank (Suma Product Code, Tesco TPN, etc.)."""
+    if is_supplier_code_field(label):
+        return False
+    n = norm_label(label)
+    if any(x in n for x in (
+        'etail code', 'retailer code', 'retailer sku', 'retailer product',
+        'buyer code', 'buyer sku',
+    )):
+        return True
+    if re.search(r'\btpn\b', n) and not any(x in n for x in ('supplier', 'vendor', 'your')):
+        return True
+    if any(x in n for x in ('product code', 'article number', 'article no')):
+        if not any(x in n for x in ('supplier', 'vendor', 'your')):
+            return True
+    for retailer in RETAILER_CODE_QUALIFIERS:
+        if retailer in n and re.search(r'code|article|tpn|sku|number|ref', n):
+            if not any(x in n for x in ('supplier', 'vendor', 'your')):
+                return True
+    return False
+
 
 def is_bare_packaging_material_header(label):
     """Single-word packaging material column headers — not product data fields."""
@@ -519,11 +565,10 @@ def map_field(label_raw, product):
             return safe_str(p.get('meursing_code'))
         return safe_str(p.get('hs_commodity_code'))
 
-    if any(x in label for x in ['sku', 'supplier code', 'supplier reference',
-                                  'reference code', 'supplier ref',
-                                  'your code', 'vendor code',
-                                  'article number', 'item code',
-                                  'product code', 'supplier item code']):
+    if is_retailer_owned_code_field(label):
+        return None
+
+    if is_supplier_code_field(label):
         return safe_str(p.get('sku_code'), '')
 
     if any(x in label for x in ['case barcode', 'outer barcode',
@@ -1373,6 +1418,13 @@ def fill_single_sheet(ws, product, value_col=3, label_col=2, example_rows=None,
 
     filled = 0
     for row, field_label in fields:
+        if is_retailer_owned_code_field(field_label):
+            if debug_tab_fill:
+                print(
+                    f"[TABS_FILL] SKIP retailer-owned code field label={field_label!r} sku={sku!r}",
+                    flush=True,
+                )
+            continue
         pre_val = pre.get(norm_label(field_label))
         if pre_val is not None and str(pre_val).strip() != '':
             if precomputed_identity_conflict(field_label, pre_val, product):

@@ -701,6 +701,7 @@ def _build_suma_tabs_wb():
     ws.cell(row=4, column=2).value = 'Suma Product Code'
     ws.cell(row=5, column=2).value = 'Full Product Name'
     ws.cell(row=6, column=2).value = 'Brand'
+    ws.cell(row=7, column=2).value = 'Supplier reference code'
     # Stale template junk (simulates Cold Brew example left on template tab)
     ws.cell(row=5, column=3).value = 'Original Cold Brew Coffee'
     ws.cell(row=6, column=3).value = 'Drift Coffee Co.'
@@ -738,13 +739,14 @@ wb_suma = openpyxl.load_workbook(io.BytesIO(base64.b64decode(res_suma['file_base
 ws_p1 = wb_suma['Product 1']
 ws_p2 = wb_suma['Product 2']
 tabs_clean = (
-    ws_p1.cell(row=4, column=3).value == 'F-ADEF-100'
+    ws_p1.cell(row=4, column=3).value in (None, '')
+    and ws_p1.cell(row=7, column=3).value == 'F-ADEF-100'
     and ws_p1.cell(row=5, column=3).value == 'Ancient Defence'
     and ws_p1.cell(row=6, column=3).value == 'Ancestral Superfoods'
     and ws_p2.cell(row=5, column=3).value == 'Original Cold Brew Coffee'
     and ws_p2.cell(row=6, column=3).value == 'Drift Coffee Co.'
 )
-print(f'{"PASS" if tabs_clean else "FAIL"} | Tabs Product 1 not contaminated by product 2 precomputed')
+print(f'{"PASS" if tabs_clean else "FAIL"} | Tabs Product 1: retailer code blank, supplier ref + identity consistent')
 results.append(tabs_clean)
 
 packaging_desc_ok = (
@@ -760,6 +762,18 @@ packaging_desc_ok = (
 print(f'{"PASS" if packaging_desc_ok else "FAIL"} | Packaging Description never maps to product_description')
 results.append(packaging_desc_ok)
 
+retailer_code_ok = (
+    _m.map_field('Suma Product Code', TEST_PRODUCT) is None
+    and _m.map_field('Ocado Article Number', TEST_PRODUCT) is None
+    and _m.map_field('Product Code', TEST_PRODUCT) is None
+    and _m.map_field('Supplier reference code', TEST_PRODUCT) == 'TB-001'
+    and _m.map_field('Supplier Product Code', TEST_PRODUCT) == 'TB-001'
+    and _m.is_retailer_owned_code_field('Suma Product Code')
+    and not _m.is_retailer_owned_code_field('Supplier reference code')
+)
+print(f'{"PASS" if retailer_code_ok else "FAIL"} | Retailer product codes blank; supplier ref → SKU')
+results.append(retailer_code_ok)
+
 # 5-product tabs: every identity field on Product 1 tab must belong to products[0]
 def _build_tabs_wb_n(n):
     wb = openpyxl.Workbook()
@@ -768,6 +782,7 @@ def _build_tabs_wb_n(n):
     ws.cell(row=4, column=2).value = 'Suma Product Code'
     ws.cell(row=5, column=2).value = 'Full Product Name'
     ws.cell(row=6, column=2).value = 'Brand name'
+    ws.cell(row=7, column=2).value = 'Supplier reference code'
     ws.cell(row=54, column=2).value = 'Packaging Description - Item/Case'
     wb.create_sheet('Notes')
     return wb
@@ -820,7 +835,9 @@ tabs5_ok = True
 for tab_i in range(5):
     ws_t = wb5[f'Product {tab_i + 1}']
     p = _tabs5[tab_i]
-    if ws_t.cell(row=4, column=3).value != p['sku_code']:
+    if ws_t.cell(row=4, column=3).value not in (None, ''):
+        tabs5_ok = False
+    if ws_t.cell(row=7, column=3).value != p['sku_code']:
         tabs5_ok = False
     if ws_t.cell(row=5, column=3).value != p['product_name']:
         tabs5_ok = False
