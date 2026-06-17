@@ -482,6 +482,12 @@ def map_field(label_raw, product):
     if is_allergen_field(label):
         return get_allergen_value(label, p.get('allergen_details', []))
 
+    if 'packaging description' in label:
+        v = safe_str(p.get('inner_packaging_material'))
+        if not v:
+            v = safe_str(p.get('case_size_description'))
+        return v if v else 'N/A'
+
     # Bare packaging headers before any weight/size matchers (never leak inner_plastic etc.).
     if is_bare_packaging_material_header(label):
         material = norm_label(label).split()[0]
@@ -543,12 +549,6 @@ def map_field(label_raw, product):
        'product name' not in label and 'usp' not in label and 'sell' not in label and \
        'packaging description' not in label:
         return safe_str(p.get('product_description'), '')
-
-    if 'packaging description' in label:
-        v = safe_str(p.get('inner_packaging_material'))
-        if not v:
-            v = safe_str(p.get('case_size_description'))
-        return v if v else 'N/A'
 
     if any(x in label for x in ['usp', 'key claims', 'unique selling',
                                   'selling point', 'key benefit',
@@ -1319,7 +1319,32 @@ def verify_fill(ws, products, value_col=3, label_col=2):
     return issues_fixed
 
 
-def fill_single_sheet(ws, product, value_col=3, label_col=2, example_rows=None, precomputed_by_label=None):
+def precomputed_identity_conflict(label, pre_val, product):
+    """Reject Step 3 precomputed values that clearly belong to a different product."""
+    n = norm_label(label)
+    val = str(pre_val).strip()
+    if not val:
+        return False
+    pname = safe_str(product.get('product_name'), '')
+    brand = safe_str(product.get('brand_name'), '')
+    if re.search(r'\bproduct name\b', n) or 'full product name' in n:
+        if pname and val != pname and not pname.startswith(val) and val not in pname:
+            return True
+    if 'brand' in n and brand and val.lower() != brand.lower():
+        return True
+    return False
+
+
+def fill_single_sheet(ws, product, value_col=3, label_col=2, example_rows=None,
+                      precomputed_by_label=None, product_index=None, debug_tab_fill=False):
+    sku = safe_str(product.get('sku_code'), '?')
+    product_name = safe_str(product.get('product_name'), '?')
+    if debug_tab_fill:
+        print(
+            f"[TABS_FILL] ENTER sheet={ws.title!r} product_index={product_index} "
+            f"sku={sku!r} name={product_name!r} precomputed_fields={len(precomputed_by_label or {})}",
+            flush=True,
+        )
     print(
         f"[FILL_FN] fill_single_sheet (VERTICAL) ENTER sheet={ws.title!r} "
         f"value_col={value_col} label_col={label_col}",
@@ -1350,14 +1375,32 @@ def fill_single_sheet(ws, product, value_col=3, label_col=2, example_rows=None, 
     for row, field_label in fields:
         pre_val = pre.get(norm_label(field_label))
         if pre_val is not None and str(pre_val).strip() != '':
-            value = pre_val
+            if precomputed_identity_conflict(field_label, pre_val, product):
+                if debug_tab_fill:
+                    print(
+                        f"[TABS_FILL] REJECT precomputed identity conflict "
+                        f"label={field_label!r} pre={pre_val!r} sku={sku!r}",
+                        flush=True,
+                    )
+                value = resolved.get(field_label)
+                source = 'map_field_guard'
+            else:
+                value = pre_val
+                source = 'precomputed'
         else:
             value = resolved.get(field_label)
+            source = 'map_field'
         if value is not None:
             if value in ('None', 'null', ''):
                 value = 'N/A'
             if safe_write(ws, row, value_col, value):
                 filled += 1
+                if debug_tab_fill:
+                    print(
+                        f"[TABS_FILL] WRITE sheet={ws.title!r} row={row} "
+                        f"label={field_label!r} value={value!r} source={source} sku={sku!r}",
+                        flush=True,
+                    )
     issues_fixed = verify_fill(ws, [product], value_col, label_col)
     return filled, issues_fixed
 
@@ -1545,6 +1588,13 @@ def execute_fill(wb, products, plan, fill_mode, precomputed=None):
     )
 
     if use_tabs and len(products) > 1:
+        print(f"[TABS_FILL] assigning {len(products)} products to tabs:", flush=True)
+        for i, p in enumerate(products):
+            print(
+                f"[TABS_FILL] index={i} tab=Product {i + 1} "
+                f"sku={safe_str(p.get('sku_code'))!r} name={safe_str(p.get('product_name'))!r}",
+                flush=True,
+            )
         for sheet_name in list(wb.sheetnames):
             if sheet_name == template_sheet_name or sheet_name in other_sheets:
                 continue
@@ -1556,6 +1606,7 @@ def execute_fill(wb, products, plan, fill_mode, precomputed=None):
         filled, issues = fill_single_sheet(
             wb[template_sheet_name], products[0], val_col, label_col, example_rows,
             precomputed_by_label=pre_by_index.get(0, {}),
+            product_index=0, debug_tab_fill=True,
         )
         total_filled += filled
         all_issues.extend(issues)
@@ -1575,6 +1626,7 @@ def execute_fill(wb, products, plan, fill_mode, precomputed=None):
             filled, issues = fill_single_sheet(
                 new_ws, product, val_col, label_col, example_rows,
                 precomputed_by_label=pre_by_index.get(i - 1, {}),
+                product_index=i - 1, debug_tab_fill=True,
             )
             total_filled += filled
             all_issues.extend(issues)

@@ -760,6 +760,78 @@ packaging_desc_ok = (
 print(f'{"PASS" if packaging_desc_ok else "FAIL"} | Packaging Description never maps to product_description')
 results.append(packaging_desc_ok)
 
+# 5-product tabs: every identity field on Product 1 tab must belong to products[0]
+def _build_tabs_wb_n(n):
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = 'Product 1'
+    ws.cell(row=4, column=2).value = 'Suma Product Code'
+    ws.cell(row=5, column=2).value = 'Full Product Name'
+    ws.cell(row=6, column=2).value = 'Brand name'
+    ws.cell(row=54, column=2).value = 'Packaging Description - Item/Case'
+    wb.create_sheet('Notes')
+    return wb
+
+_tabs5 = [
+    {
+        'product_name': f'Ancestral Product {i}',
+        'brand_name': f'Ancestral Brand {i}',
+        'sku_code': f'F-SKU-{i}',
+        'product_description': f'Organic Raw Activated description {i}',
+        'inner_packaging_material': f'Pouch type {i}',
+        'allergen_details': [], 'certifications': [],
+    }
+    for i in range(5)
+]
+_buf5 = io.BytesIO()
+_build_tabs_wb_n(5).save(_buf5)
+# Simulate stale __shared__ contamination: product 2 name/brand in index-0 precomputed
+_contaminated_pre = []
+for idx, p in enumerate(_tabs5):
+    _contaminated_pre.extend([
+        {'sheet_name': f'Product {idx + 1}', 'row': 4, 'col': 3,
+         'value': p['sku_code'], 'field_label': 'Suma Product Code', 'product_index': idx},
+        {'sheet_name': f'Product {idx + 1}', 'row': 5, 'col': 3,
+         'value': p['product_name'], 'field_label': 'Full Product Name', 'product_index': idx},
+        {'sheet_name': f'Product {idx + 1}', 'row': 6, 'col': 3,
+         'value': p['brand_name'], 'field_label': 'Brand name', 'product_index': idx},
+    ])
+# Old bug: product 1's name leaked onto Product 1 tab precomputed index 0
+_contaminated_pre.append({
+    'sheet_name': 'Product 1', 'row': 5, 'col': 3,
+    'value': 'Pure Pea Protein WRONG', 'field_label': 'Full Product Name', 'product_index': 0,
+})
+_contaminated_pre.append({
+    'sheet_name': 'Product 1', 'row': 6, 'col': 3,
+    'value': 'Form Nutrition WRONG', 'field_label': 'Brand name', 'product_index': 0,
+})
+req5 = FillRequest(
+    file_base64=base64.b64encode(_buf5.getvalue()).decode(),
+    products=_tabs5,
+    retailer_name='Suma',
+    fill_mode='tabs',
+    form_spec={'layout': 'vertical', 'data_sheet': 'Product 1', 'label_column': 2, 'value_column': 3},
+    precomputed_mappings=_contaminated_pre,
+)
+res5 = asyncio.run(fill_nlf(req5))
+wb5 = openpyxl.load_workbook(io.BytesIO(base64.b64decode(res5['file_base64'])))
+ws5_p1 = wb5['Product 1']
+tabs5_ok = True
+for tab_i in range(5):
+    ws_t = wb5[f'Product {tab_i + 1}']
+    p = _tabs5[tab_i]
+    if ws_t.cell(row=4, column=3).value != p['sku_code']:
+        tabs5_ok = False
+    if ws_t.cell(row=5, column=3).value != p['product_name']:
+        tabs5_ok = False
+    if ws_t.cell(row=6, column=3).value != p['brand_name']:
+        tabs5_ok = False
+    pkg = ws_t.cell(row=54, column=3).value
+    if pkg == p['product_description']:
+        tabs5_ok = False
+print(f'{"PASS" if tabs5_ok else "FAIL"} | 5-product tabs: identity consistent + packaging != description')
+results.append(tabs5_ok)
+
 print()
 print('--- Missing API key / Claude mock tests ---')
 
