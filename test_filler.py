@@ -32,6 +32,7 @@ TEST_PRODUCT = {
     'units_per_case': 6,
     'case_size_description': '6 x 500g',
     'vat_rate': 'Zero',
+    'tax_status': 'Zero-rated',
     'shelf_life_weeks': 52,
     'storage_conditions': 'Ambient',
     'country_of_origin': 'United Kingdom',
@@ -84,7 +85,7 @@ results.append(test('MSRP per Unit (USD)', '19.99'))
 results.append(test('Wholesale Price per Case (ex VAT)', '95.0'))
 results.append(test('Trade Price per Case', '95.0'))
 results.append(test('Units per Case', '6'))
-results.append(test('VAT Rate', 'Zero'))
+results.append(test('VAT Rate', 'Zero-rated'))
 results.append(test('Lead Time (days)', 'N/A'))
 
 results.append(test('Shelf Life (weeks from manufacture)', '52'))

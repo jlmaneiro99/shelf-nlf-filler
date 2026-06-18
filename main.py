@@ -139,7 +139,14 @@ def safe_write(ws, row, col, value, field_label=None):
                 if len(str(value)) > 500:
                     value = str(value)[:500]
                 options = dropdown_options_for_cell(ws, target.row, target.column)
-                if options:
+                if field_label and is_tax_field(field_label):
+                    if not options:
+                        extracted = extract_rate_from_tax_status(value)
+                        if extracted and ('%' in str(value) or '(' in str(value)):
+                            value = extracted
+                    elif options:
+                        value = match_to_dropdown(value, options, field_label=field_label)
+                elif options:
                     value = match_to_dropdown(value, options, field_label=field_label)
                 target.value = value
                 _WriteTracker.record(ws.title, target.row, target.column)
@@ -151,7 +158,14 @@ def safe_write(ws, row, col, value, field_label=None):
     if len(str(value)) > 500:
         value = str(value)[:500]
     options = dropdown_options_for_cell(ws, row, col)
-    if options:
+    if field_label and is_tax_field(field_label):
+        if not options:
+            extracted = extract_rate_from_tax_status(value)
+            if extracted and ('%' in str(value) or '(' in str(value)):
+                value = extracted
+        elif options:
+            value = match_to_dropdown(value, options, field_label=field_label)
+    elif options:
         value = match_to_dropdown(value, options, field_label=field_label)
     cell.value = value
     _WriteTracker.record(ws.title, row, col)
@@ -546,6 +560,27 @@ def is_ingredients_field(label):
     return any(x in n for x in ('ingredients on pack', 'ingredient declaration', 'full ingredients'))
 
 
+def is_tax_field(label):
+    n = norm_label(label)
+    return any(x in n for x in [
+        'vat rate', 'vat', 'tax rate', 'gst rate', 'hst', 'sales tax',
+        'tax / vat', 'tax type', 'tax status', 'tax code', 'taxable', 'tax treatment',
+    ])
+
+
+def extract_rate_from_tax_status(status):
+    m = re.search(r'(\d+(?:\.\d+)?)\s*%', str(status or ''))
+    return m.group(1) if m else None
+
+
+def resolve_tax_status(p):
+    direct = p.get('tax_status')
+    if direct is not None and str(direct).strip():
+        return str(direct).strip()
+    legacy = safe_str(p.get('vat_rate'), '')
+    return legacy
+
+
 def canonicalize_dropdown_value(value, field_label=None):
     """Map common wrong values to Suma-style dropdown semantics before option match."""
     v = str(value).strip()
@@ -615,12 +650,40 @@ def match_to_dropdown(value, options, field_label=None):
         'not present': ['n/a', 'na', 'none', 'absent', 'not present', 'free from', 'not applicable'],
         'present': ['present', 'contains', 'yes'],
         'may contain': ['may contain', 'possible contamination', 'may contain traces', 'traces'],
-        'zero rated': ['zero', 'zero rated', '0%'],
-        'standard': ['standard', 'standard 20%', '20%'],
-        'reduced': ['reduced', 'reduced 5%', '5%'],
+        'zero rated': ['zero', 'zero rated', 'zero-rated', '0%'],
+        'zero-rated': ['zero', 'zero rated', 'zero-rated', '0%', 'gst-free', 'gst free'],
+        'standard': ['standard', 'standard 20%', 'standard (20%)', '20%'],
+        'reduced': ['reduced', 'reduced 5%', 'reduced (5%)', '5%'],
+        'exempt': ['exempt', 'non-taxable', 'non taxable'],
+        'gst': ['gst', 'gst 10%', 'gst (10%)', '10%'],
+        'gst-free': ['gst-free', 'gst free', 'zero-rated', 'zero rated'],
+        'taxable': ['taxable', 'yes'],
+        'non-taxable': ['non-taxable', 'non taxable', 'exempt'],
         'yes': ['yes', 'y'],
         'no': ['no', 'n'],
     }
+    stored_tax_aliases = {
+        'standard (20%)': ['standard', 'standard 20%', 'standard rated', '20%'],
+        'reduced (5%)': ['reduced', 'reduced 5%', '5%'],
+        'standard (23%)': ['standard', 'standard 23%', '23%'],
+        'reduced (13.5%)': ['reduced', 'reduced 13.5%', '13.5%'],
+        'second reduced (9%)': ['second reduced', 'reduced 9%', '9%'],
+        'zero-rated': ['zero', 'zero rated', 'zero-rated', '0%', 'gst-free'],
+        'exempt': ['exempt'],
+        'gst (10%)': ['gst', 'gst 10%', '10%'],
+        'gst-free': ['gst-free', 'gst free', 'zero-rated'],
+        'gst (15%)': ['gst', 'gst 15%', '15%'],
+        'taxable': ['taxable'],
+        'non-taxable': ['non-taxable', 'non taxable', 'exempt'],
+    }
+    if vl in stored_tax_aliases:
+        for opt in options:
+            key = str(opt).strip().lower()
+            if key in stored_tax_aliases[vl] or vl == key:
+                return str(opt)
+            aliases = alias_groups.get(key, [])
+            if any(a in stored_tax_aliases[vl] for a in aliases):
+                return str(opt)
     for opt in options:
         key = str(opt).strip().lower()
         aliases = alias_groups.get(key, [])
@@ -807,8 +870,8 @@ def map_field(label_raw, product):
 
     if any(x in label for x in ['vat rate', 'vat', 'tax rate', 'gst rate',
                                   'hst', 'sales tax', 'tax / vat',
-                                  'tax type']):
-        return safe_str(p.get('vat_rate'), '')
+                                  'tax type', 'tax status', 'tax code', 'taxable']):
+        return resolve_tax_status(p)
 
     if any(x in label for x in ['minimum order', 'moq', 'min order',
                                   'minimum quantity']):
