@@ -138,6 +138,9 @@ def safe_write(ws, row, col, value, field_label=None):
                     return False
                 if len(str(value)) > 500:
                     value = str(value)[:500]
+                options = dropdown_options_for_cell(ws, target.row, target.column)
+                if options:
+                    value = match_to_dropdown(value, options, field_label=field_label)
                 target.value = value
                 _WriteTracker.record(ws.title, target.row, target.column)
                 return True
@@ -147,6 +150,9 @@ def safe_write(ws, row, col, value, field_label=None):
         return False
     if len(str(value)) > 500:
         value = str(value)[:500]
+    options = dropdown_options_for_cell(ws, row, col)
+    if options:
+        value = match_to_dropdown(value, options, field_label=field_label)
     cell.value = value
     _WriteTracker.record(ws.title, row, col)
     return True
@@ -478,7 +484,7 @@ def resolve_values_for_labels(labels, product):
 
 def get_allergen_value(label, allergen_details):
     if not allergen_details:
-        return 'Not Present'
+        return 'Not present'
     label_lower = label.lower()
     for category, keywords in ALLERGEN_KEYS:
         if any(kw in label_lower for kw in keywords):
@@ -488,13 +494,32 @@ def get_allergen_value(label, allergen_details):
                     if a.get('present_in_formulation') or a.get('present'):
                         return 'Present'
                     if a.get('may_contain_traces') or a.get('may_contain'):
-                        return 'May Contain'
-            return 'Not Present'
-    return 'Not Present'
+                        return 'May contain'
+            return 'Not present'
+    return 'Not present'
+
+
+def allergen_keyword_matches_label(keyword, label_lower):
+    """Avoid false positives — e.g. 'nut' must not match 'nutrient'."""
+    if keyword == 'nut':
+        return (
+            bool(re.search(r'\bnuts?\b', label_lower))
+            or 'tree nut' in label_lower
+            or 'peanut' in label_lower
+        )
+    if keyword == 'egg':
+        return bool(re.search(r'\beggs?\b', label_lower))
+    if keyword in ('soy', 'soya'):
+        return 'soy' in label_lower or 'soya' in label_lower
+    if len(keyword) <= 4:
+        return bool(re.search(rf'\b{re.escape(keyword)}', label_lower))
+    return keyword in label_lower
 
 
 def is_allergen_field(label):
     label_lower = label.lower()
+    if any(x in label_lower for x in ('hfss', 'nutrient profil', 'npm score', 'nutrient scoring')):
+        return False
     if 'gluten free' in label_lower or 'gluten-free' in label_lower:
         return False
     if 'free from' in label_lower:
@@ -504,9 +529,104 @@ def is_allergen_field(label):
     if 'soy free' in label_lower or 'soya free' in label_lower:
         return False
     for _, keywords in ALLERGEN_KEYS:
-        if any(kw in label_lower for kw in keywords):
+        if any(allergen_keyword_matches_label(kw, label_lower) for kw in keywords):
             return True
     return False
+
+
+def is_ingredients_field(label):
+    """Only explicit ingredients fields — never trademark/criteria rows."""
+    n = norm_label(label)
+    if any(x in n for x in ('trademark', 'criteria', 'certification', 'vegsoc', 'vegetarian society')):
+        return False
+    if n in ('ingredients', 'ingredients list', 'ingredient list', 'list of ingredients'):
+        return True
+    if n.startswith('ingredients ') or n.endswith(' ingredients'):
+        return True
+    return any(x in n for x in ('ingredients on pack', 'ingredient declaration', 'full ingredients'))
+
+
+def canonicalize_dropdown_value(value, field_label=None):
+    """Map common wrong values to Suma-style dropdown semantics before option match."""
+    v = str(value).strip()
+    if not v:
+        return v
+    vl = v.lower()
+    label = norm_label(field_label or '')
+    if field_label and is_allergen_field(label):
+        if vl in ('present', 'contains', 'yes'):
+            return 'Present'
+        if vl in ('may contain', 'possible contamination', 'may contain traces', 'traces', 'may contain trace'):
+            return 'May contain'
+        if vl in ('not present', 'n/a', 'na', 'none', 'absent', 'free from', 'not applicable'):
+            return 'Not present'
+    return v
+
+
+def parse_dropdown_list_formula(formula1):
+    if formula1 is None:
+        return []
+    f = str(formula1).strip()
+    if f.startswith('"') and f.endswith('"'):
+        inner = f[1:-1]
+        return [part.strip() for part in inner.split(',') if part.strip()]
+    return []
+
+
+def _cell_in_sqref(row, col, sqref):
+    from openpyxl.utils import range_boundaries
+    ref = str(sqref)
+    for part in ref.split():
+        if ':' in part:
+            min_col, min_row, max_col, max_row = range_boundaries(part)
+            if min_row <= row <= max_row and min_col <= col <= max_col:
+                return True
+        else:
+            from openpyxl.utils.cell import coordinate_to_tuple
+            r, c = coordinate_to_tuple(part)
+            if r == row and c == col:
+                return True
+    return False
+
+
+def dropdown_options_for_cell(ws, row, col):
+    options = []
+    for dv in ws.data_validations.dataValidation:
+        if getattr(dv, 'type', None) != 'list':
+            continue
+        if not _cell_in_sqref(row, col, dv.sqref):
+            continue
+        parsed = parse_dropdown_list_formula(dv.formula1)
+        if parsed:
+            return parsed
+    return options
+
+
+def match_to_dropdown(value, options, field_label=None):
+    """Case-insensitive match; return the allowed option's exact casing."""
+    if not options:
+        return canonicalize_dropdown_value(value, field_label)
+    v = canonicalize_dropdown_value(value, field_label)
+    vl = str(v).strip().lower()
+    for opt in options:
+        if str(opt).strip().lower() == vl:
+            return str(opt)
+    alias_groups = {
+        'not present': ['n/a', 'na', 'none', 'absent', 'not present', 'free from', 'not applicable'],
+        'present': ['present', 'contains', 'yes'],
+        'may contain': ['may contain', 'possible contamination', 'may contain traces', 'traces'],
+        'zero rated': ['zero', 'zero rated', '0%'],
+        'standard': ['standard', 'standard 20%', '20%'],
+        'reduced': ['reduced', 'reduced 5%', '5%'],
+        'yes': ['yes', 'y'],
+        'no': ['no', 'n'],
+    }
+    for opt in options:
+        key = str(opt).strip().lower()
+        aliases = alias_groups.get(key, [])
+        if vl in aliases or any(vl == a for a in aliases):
+            return str(opt)
+    return v
 
 
 def nutritional_value(val, label, serving_size):
@@ -533,6 +653,14 @@ def map_field(label_raw, product):
     label = label_raw.lower().strip().rstrip('*').strip()
     p = product
     serving = p.get('serving_size_value')
+
+    # HFSS score — BEFORE allergen matcher ('nut' in 'nutrient' false positive).
+    if any(x in label for x in ['hfss score', 'nutrient profile score',
+                                  'nutrient profiling score', 'npm score', 'hfss nutrient']):
+        v = p.get('hfss_score')
+        if v is None or v == '':
+            return 'N/A'
+        return safe_str(v, 'N/A')
 
     if is_allergen_field(label):
         return get_allergen_value(label, p.get('allergen_details', []))
@@ -611,7 +739,7 @@ def map_field(label_raw, product):
                                   'consumer description', 'website description']):
         return safe_str(p.get('usp'), '')
 
-    if 'ingredient' in label:
+    if 'ingredient' in label and is_ingredients_field(label):
         return safe_str(p.get('ingredients'))
 
     # Unit Size / UOM — Dundeis, BP, and similar horizontal forms
@@ -774,6 +902,9 @@ def map_field(label_raw, product):
     if 'vegan' in label and 'non' not in label:
         return 'Yes' if p.get('is_vegan') else 'No'
 
+    if any(x in label for x in ['vegetarian society trademark', 'vegsoc trademark', 'vegsoc']):
+        return 'Yes' if p.get('vegsoc_trademark') else 'No'
+
     if 'vegetarian' in label and 'non' not in label:
         return 'Yes' if p.get('is_vegetarian') else 'No'
 
@@ -820,10 +951,6 @@ def map_field(label_raw, product):
     if any(x in label for x in ['hfss scope', 'is product hfss',
                                   'hfss in scope']):
         return 'Yes' if p.get('hfss_scope') else 'No'
-
-    if any(x in label for x in ['hfss score', 'nutrient profile score',
-                                  'npm score', 'hfss nutrient']):
-        return safe_str(p.get('hfss_score'))
 
     if any(x in label for x in ['less healthy', 'hfss less healthy',
                                   'is product less healthy']):
@@ -1209,7 +1336,7 @@ def apply_precomputed_mappings(wb, mappings, plan, fill_mode='auto', num_product
         existing = ws.cell(row=int(row), column=int(col))
         if is_formula_cell(existing):  # FIX 5 — formula protection
             continue
-        if safe_write(ws, int(row), int(col), str(value)):
+        if safe_write(ws, int(row), int(col), str(value), field_label=entry.get('field_label') or entry.get('label')):
             filled += 1
     return filled
 
@@ -1434,7 +1561,7 @@ def fill_single_sheet(ws, product, value_col=3, label_col=2, example_rows=None,
                     flush=True,
                 )
             continue
-        pre_val = pre.get(norm_label(field_label))
+        pre_val = pre.get(norm_label(field_label)) or pre.get(f'@row:{row}')
         if pre_val is not None and str(pre_val).strip() != '':
             if precomputed_identity_conflict(field_label, pre_val, product):
                 if debug_tab_fill:
@@ -1454,7 +1581,7 @@ def fill_single_sheet(ws, product, value_col=3, label_col=2, example_rows=None,
         if value is not None:
             if value in ('None', 'null', ''):
                 value = 'N/A'
-            if safe_write(ws, row, value_col, value):
+            if safe_write(ws, row, value_col, value, field_label=field_label):
                 filled += 1
                 if debug_tab_fill:
                     print(
@@ -1484,6 +1611,12 @@ def build_precomputed_by_label(precomputed):
         except (TypeError, ValueError):
             idx = 0
         by_index.setdefault(idx, {})[norm_label(label)] = str(value)
+        row = entry.get('row')
+        if row:
+            try:
+                by_index.setdefault(idx, {})[f'@row:{int(row)}'] = str(value)
+            except (TypeError, ValueError):
+                pass
     return by_index
 
 

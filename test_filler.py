@@ -116,11 +116,17 @@ results.append(test('Sodium mg per serving', '120'))
 
 results.append(test('Added Sugars g per serving', '0'))
 
-results.append(test('Milk', 'May Contain'))
-results.append(test('Milk / Dairy', 'May Contain'))
-results.append(test('Eggs', 'Not Present'))
-results.append(test('Peanuts', 'Not Present'))
-results.append(test('Cereals Containing Gluten', 'Not Present'))
+results.append(test('Milk', 'May contain'))
+results.append(test('Milk / Dairy', 'May contain'))
+results.append(test('Eggs', 'Not present'))
+results.append(test('Peanuts', 'Not present'))
+results.append(test('Cereals Containing Gluten', 'Not present'))
+
+hfss_product = {**TEST_PRODUCT, 'hfss_score': 4}
+results.append(test('HFSS Score (Nutrient Profiling Score)', '4', product=hfss_product))
+
+vegsoc_product = {**TEST_PRODUCT, 'vegsoc_trademark': False, 'ingredients': 'must not leak here'}
+results.append(test('Vegetarian society trademark criteria', 'No', product=vegsoc_product))
 
 # Conservative compliance — NASAA must not infer from generic Organic
 nasaa_product = {**TEST_PRODUCT, 'is_organic': True, 'certifications': ['Organic', 'Vegan']}
