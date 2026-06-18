@@ -743,8 +743,8 @@ def map_field(label_raw, product):
         return 'N/A'
 
     if re.search(r'\bproduct name\b', label) or label in (
-        'name of product', 'article name', 'item name', 'product title',
-        'full product name', 'product name on pack', 'product name *',
+        'name of product', 'article name', 'item name', 'item description',
+        'product title', 'full product name', 'product name on pack', 'product name *',
     ):
         return safe_str(p.get('product_name'), '')
 
@@ -774,23 +774,25 @@ def map_field(label_raw, product):
     if any(x in label for x in ['case barcode', 'outer barcode',
                                   'case ean', 'shipper barcode',
                                   'carton barcode', 'case gtin',
-                                  'case upc', 'outer ean',
+                                  'case upc', 'outer ean', 'outer upc',
                                   'upc barcode case', 'barcode case',
-                                  'barcode — case']):
-        return safe_str(p.get('case_barcode'))
+                                  'barcode — case', 'gtin case', 'ean case']):
+        return safe_str(p.get('case_barcode'), 'N/A')
 
     if any(x in label for x in ['ean', 'barcode', 'gtin', 'upc',
                                   'unit barcode', 'individual barcode',
                                   'individual unit barcode',
                                   'product barcode', 'item barcode',
-                                  'unit ean', 'unit gtin']):
-        return safe_str(p.get('ean_barcode'), '')
+                                  'unit ean', 'unit gtin', 'upc barcode']):
+        return safe_str(p.get('ean_barcode'), 'N/A')
 
     if any(x in label for x in ['variant', 'pack size', 'product size',
                                   'size / format', 'format', 'pack format']):
         return safe_str(p.get('variant'), '')
 
-    if ('product description' in label or re.search(r'\bdescription\b', label)) and \
+    if ('product description' in label or (
+        re.search(r'\bdescription\b', label) and 'item' not in label
+    )) and \
        'product name' not in label and 'usp' not in label and 'sell' not in label and \
        'packaging description' not in label:
         return safe_str(p.get('product_description'), '')

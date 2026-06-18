@@ -79,6 +79,13 @@ results.append(test('EAN Barcode (Unit)', '5060000000001'))
 results.append(test('Individual unit barcode', '5060000000001'))
 results.append(test('Case Barcode', 'N/A'))
 results.append(test('UPC Barcode Case', 'N/A'))
+results.append(test('Item Description', 'Test Protein Powder'))
+results.append(test('Item Name', 'Test Protein Powder'))
+results.append(test('UPC Barcode', '5060000000001'))
+
+case_upc_product = {**TEST_PRODUCT, 'ean_barcode': '5060000000001', 'case_barcode': '19310000444009'}
+results.append(test('UPC Barcode Case', '19310000444009', product=case_upc_product))
+results.append(test('UPC Barcode', '5060000000001', product=case_upc_product))
 
 results.append(test('RRP per Unit (inc VAT)', '19.99'))
 results.append(test('MSRP per Unit (USD)', '19.99'))
