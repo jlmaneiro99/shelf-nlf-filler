@@ -72,12 +72,21 @@ def anthropic_config_status() -> Dict[str, Any]:
 
 
 class _FillGuard:
-    """Tracks blocked formula writes during a single /fill request."""
-    formula_blocks = 0
+    """Tracks formula cells skipped during a single /fill request (expected behaviour)."""
+    formula_skips = 0
 
     @classmethod
     def reset(cls):
-        cls.formula_blocks = 0
+        cls.formula_skips = 0
+
+    @classmethod
+    def skip_formula(cls, sheet, row, col, label=None):
+        cls.formula_skips += 1
+        loc = f"{sheet}!{row}:{col}"
+        if label:
+            print(f"[FILL] skip formula cell {loc} ({label!r})", flush=True)
+        else:
+            print(f"[FILL] skip formula cell {loc}", flush=True)
 
 
 class _WriteTracker:
@@ -117,7 +126,7 @@ def count_formula_cells(wb):
     return count
 
 
-def safe_write(ws, row, col, value):
+def safe_write(ws, row, col, value, field_label=None):
     cell = ws.cell(row=row, column=col)
     if isinstance(cell, MergedCell):
         for rng in ws.merged_cells.ranges:
@@ -125,7 +134,7 @@ def safe_write(ws, row, col, value):
                     rng.min_col <= col <= rng.max_col):
                 target = ws.cell(row=rng.min_row, column=rng.min_col)
                 if is_formula_cell(target):
-                    _FillGuard.formula_blocks += 1
+                    _FillGuard.skip_formula(ws.title, target.row, target.column, field_label)
                     return False
                 if len(str(value)) > 500:
                     value = str(value)[:500]
@@ -134,7 +143,7 @@ def safe_write(ws, row, col, value):
                 return True
         return False
     if is_formula_cell(cell):
-        _FillGuard.formula_blocks += 1
+        _FillGuard.skip_formula(ws.title, row, col, field_label)
         return False
     if len(str(value)) > 500:
         value = str(value)[:500]
@@ -1835,13 +1844,10 @@ async def fill_nlf(req: FillRequest):
             raise HTTPException(status_code=422, detail=conflict)
 
         formula_count_after = count_formula_cells(wb)
-        if _FillGuard.formula_blocks > 0:
-            raise HTTPException(
-                status_code=500,
-                detail=(
-                    f'Formula protection violation: blocked {_FillGuard.formula_blocks} '
-                    f'write attempt(s) to formula cells. File not returned.'
-                ),
+        if _FillGuard.formula_skips > 0:
+            print(
+                f"[FILL] skipped {_FillGuard.formula_skips} formula cell(s) — left for form to compute",
+                flush=True,
             )
         if formula_count_after < formula_count_before:
             raise HTTPException(

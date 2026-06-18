@@ -170,19 +170,25 @@ formula_ok = isinstance(formula_val, str) and formula_val.startswith('=') and va
 print(f'{"PASS" if formula_ok else "FAIL"} | Formula preserved + value filled: formula={formula_val!r} value={out_wb["Data"]["B4"].value!r}')
 results.append(formula_ok)
 
-# Formula write attempt → API refuses file (HTTP 500)
+# Formula in value column → skip silently, file still returned, formula intact
 wb_formula_target = openpyxl.Workbook()
 ws_ft = wb_formula_target.active
 ws_ft.title = 'Data'
 ws_ft['A1'] = 5
 ws_ft['A4'] = 'Product Name'
 ws_ft['B4'] = '=A1*2'
+ws_ft['A5'] = 'Brand'
 file_bytes_ft = io.BytesIO()
 wb_formula_target.save(file_bytes_ft)
 b64_ft = base64.b64encode(file_bytes_ft.getvalue()).decode()
 req_ft = FillRequest(
     file_base64=b64_ft,
-    products=[{'product_name': 'Blocked', 'allergen_details': [], 'certifications': []}],
+    products=[{
+        'product_name': 'Should Not Overwrite',
+        'brand_name': 'TestBrand',
+        'allergen_details': [],
+        'certifications': [],
+    }],
     retailer_name='Test',
     form_spec={
         'data_sheet': 'Data',
@@ -194,13 +200,16 @@ req_ft = FillRequest(
         'field_map': [],
     },
 )
-formula_refusal_ok = False
-try:
-    asyncio.run(fill_nlf(req_ft))
-except Exception as e:
-    formula_refusal_ok = 'Formula protection' in str(e)
-print(f'{"PASS" if formula_refusal_ok else "FAIL"} | Formula write attempt returns error (no file)')
-results.append(formula_refusal_ok)
+res_ft = asyncio.run(fill_nlf(req_ft))
+out_ft = openpyxl.load_workbook(io.BytesIO(base64.b64decode(res_ft['file_base64'])))
+formula_skip_ok = (
+    isinstance(out_ft['Data']['B4'].value, str)
+    and str(out_ft['Data']['B4'].value).startswith('=')
+    and out_ft['Data']['B5'].value == 'TestBrand'
+    and res_ft.get('fields_filled', 0) >= 1
+)
+print(f'{"PASS" if formula_skip_ok else "FAIL"} | Formula value cell skipped, other cells filled, file returned')
+results.append(formula_skip_ok)
 
 # Example row protection
 wb2 = openpyxl.Workbook()
